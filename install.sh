@@ -133,6 +133,23 @@ install_systemd() {
     if [[ ! -f "$CONF_DIR/config.toml" ]]; then
         install -m 0644 "$REPO_DIR/deploy/config.example.toml" "$CONF_DIR/config.toml"
     fi
+    # Dev installs frequently point the editable .pth at a path under
+    # /home, which the unit's ProtectHome=true hides from the service.
+    # Add a drop-in that relaxes it to read-only (still blocks writes
+    # to /home — keeps the hardening intent intact). Safe no-op when
+    # REPO_DIR isn't under /home.
+    if [[ "$DEV_MODE" == "true" ]]; then
+        local dropin_dir="$SYSTEMD_DIR/gpsdo-monitor.service.d"
+        install -d -m 0755 "$dropin_dir"
+        cat > "$dropin_dir/dev.conf" <<'UNITEOF'
+# Written by install.sh --dev. The editable install points at the
+# repo under /home; unit's ProtectHome=true would hide it, so the
+# service would fail to import the package. read-only keeps /home
+# accessible (imports work) while still blocking writes.
+[Service]
+ProtectHome=read-only
+UNITEOF
+    fi
     systemctl daemon-reload
     systemctl enable gpsdo-monitor.service
     systemctl restart gpsdo-monitor.service || true

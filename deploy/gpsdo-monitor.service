@@ -20,6 +20,10 @@ ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 PrivateDevices=false
+# char-usb_device covers /dev/bus/usb/NNN/MMM (major 189). Needed
+# because the python `hidapi` PyPI wheel is built against libusb and
+# opens the USB-transport node rather than /dev/hidraw*.
+DeviceAllow=char-usb_device rw
 DeviceAllow=char-hidraw rw
 DeviceAllow=char-ttyACM rw
 NoNewPrivileges=true

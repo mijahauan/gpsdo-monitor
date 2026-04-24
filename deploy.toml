@@ -5,11 +5,20 @@
 # subcommands), but sigmond can still install, start, stop, and
 # monitor its one systemd unit.
 
-schema = "0.5"
-name   = "gpsdo-monitor"
-kind   = "infra"
+[package]
+name             = "gpsdo-monitor"
+version          = "0.1.0"
+description      = "Leo Bodnar GPSDO health monitor + mDNS advertiser"
+license          = "MIT"
+kind             = "infra"
 
-[units.gpsdo-monitor]
-type        = "static"
-unit        = "gpsdo-monitor.service"
-description = "Leo Bodnar GPSDO health monitor + mDNS advertiser"
+# ---------------------------------------------------------------------------
+# Systemd units sigmond's lifecycle layer manages on this client's behalf.
+# Lifecycle resolver reads [systemd].units (concrete) and
+# [systemd].templated_units (one-per-configured-instance).
+# ---------------------------------------------------------------------------
+
+[systemd]
+units = [
+    "gpsdo-monitor.service",
+]

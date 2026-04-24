@@ -1,9 +1,18 @@
 # udev rules for Leo Bodnar GPSDOs (VID 0x1dd2)
 #
-# Grants the `gpsdo` group read/write access to the HID node and the
-# CDC ACM port (1421/1423 NMEA + 1PPS carrier).
+# Grants the `gpsdo` group read/write access to:
+#   - the raw USB device node (/dev/bus/usb/NNN/MMM) — required by the
+#     hidapi libusb backend (the wheel on PyPI), which opens the device
+#     at the USB-transport layer rather than via hidraw;
+#   - the HID node (/dev/hidraw*) — for any caller using the hidraw
+#     backend or raw ioctls;
+#   - the CDC ACM port (/dev/ttyACM*) — 1421/1423 stream NMEA here and
+#     carry 1PPS on DCD.
 
-# HID feature-report channel (all variants)
+# USB device node — libusb backend (python hidapi wheel)
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1dd2", MODE="0660", GROUP="gpsdo"
+
+# HID feature-report channel (all variants) — hidraw backend
 SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1dd2", MODE="0660", GROUP="gpsdo"
 
 # CDC ACM — 1421/1423 stream NMEA here and carry 1PPS on DCD
