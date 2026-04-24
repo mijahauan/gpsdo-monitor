@@ -1,17 +1,23 @@
 """Long-running probe daemon.
 
-One iteration per probe tick:
-  1. Discovery.match() against configured [[device]] entries.
-  2. For each matched (DeclaredDevice, HidCandidate):
-       open the right model, call get_status(), merge NMEA/UBX state,
-       classify A-level, build schema.DeviceReport, atomic-write JSON.
-  3. Refresh mDNS advertisements; withdraw any that vanished.
-  4. Update /run/gpsdo/index.json.
-  5. sd_notify WATCHDOG=1 and sleep probe_interval_sec.
+One `DeviceWorker` per matched device owns:
 
-This skeleton wires the lifecycle but leaves NMEA / UBX coroutines and
-PPS edge-capture as stubs (see nmea.py / ubx.py / pps.py placeholders
-to be filled in once the first hardware bring-up starts).
+  - the HID path (opened per-tick, consistent with the one-shot CLI);
+  - a long-lived `NmeaReader` thread on the CDC port (1421/1423 only),
+    so per-tick NMEA snapshots are non-blocking;
+  - a `PpsTracker` thread on the CDC DCD line (1421/1423 only), which
+    uses TIOCMIWAIT so idle CPU stays flat between edges;
+  - a cache of the UBX-MON-VER firmware answer (Mini only), since that
+    poll takes seconds and never changes after the first success.
+
+Each probe tick the `Service` calls `worker.build_report(host)`, which
+assembles a schema-v1 `DeviceReport` from the HID bitmap, the NMEA
+snapshot, the PPS rolling window, and the cached firmware, then writes
+`/run/gpsdo/<serial>.json` atomically. `index.json` follows with the
+aggregate list for fast TUI consumption.
+
+mDNS advertisements are refreshed on every tick and withdrawn when
+`match()` no longer sees the device.
 """
 from __future__ import annotations
 
@@ -20,19 +26,24 @@ import signal
 import socket
 import threading
 import time
-from dataclasses import asdict
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
 from gpsdo_monitor import SCHEMA_VERSION
-from gpsdo_monitor.config import Config
+from gpsdo_monitor.advisories import lookup_protver
+from gpsdo_monitor.config import Config, DeclaredDevice
 from gpsdo_monitor.discovery import DiscoveryResult, match
 from gpsdo_monitor.health import classify
 from gpsdo_monitor.hid_xport import HidCandidate
 from gpsdo_monitor.models import open_model
+from gpsdo_monitor.nmea import NmeaReader, find_ttys_by_usb_serial
+from gpsdo_monitor.pps import PpsTracker
 from gpsdo_monitor.publish import Advertiser
 from gpsdo_monitor.schema import (
     Device,
     DeviceReport,
+    FirmwareAdvisory,
     IndexEntry,
     IndexFile,
     PpsStudy,
@@ -44,23 +55,182 @@ from gpsdo_monitor.schema import (
 log = logging.getLogger("gpsdo_monitor.service")
 
 
+def _sanitize(serial: str) -> str:
+    return "".join(c if c.isalnum() or c in "-_" else "-" for c in serial) or "unknown"
+
+
+# --- Per-device worker --------------------------------------------------
+
+
+@dataclass
+class DeviceWorker:
+    """Owns the long-lived threads and caches for one physical device.
+
+    Stateless CLI code paths (the `status` command) don't need this
+    class — they read everything at once. The daemon does, because
+    opening and closing an NMEA tty every 10 s hides freshly-lost fixes
+    and the PPS edge window would never fill."""
+
+    candidate: HidCandidate
+    declared: DeclaredDevice
+    cfg: Config
+    nmea: Optional[NmeaReader] = None
+    pps: Optional[PpsTracker] = None
+    tty_path: Optional[Path] = None
+    firmware: Optional[str] = None
+    firmware_source: str = "unavailable"
+    firmware_advisory: Optional[FirmwareAdvisory] = None
+    mon_ver_tried: bool = False
+    started_mono: float = 0.0
+
+    # --- lifecycle ---------------------------------------------------
+
+    def start(self) -> None:
+        self.started_mono = time.monotonic()
+        if not self.candidate.serial:
+            log.warning("device at %s has no USB serial — NMEA/PPS skipped",
+                        self.candidate.path)
+            return
+        ttys = find_ttys_by_usb_serial(self.candidate.serial)
+        if not ttys:
+            return
+        self.tty_path = ttys[0]
+
+        # NMEA is the right default for any CDC-capable device; if the
+        # driver says has_nmea_cdc the tty will carry $G sentences.
+        # We still start the reader speculatively — if the port refuses
+        # to open (permissions, contention) the reader records
+        # `open_error` and returns; snapshot keeps returning empty
+        # state, and classify() falls back to gps_locked from the HID
+        # bitmap. That's the correct degradation.
+        self.nmea = NmeaReader(self.tty_path)
+        self.nmea.start()
+
+        if self.cfg.pps_study_enabled:
+            self.pps = PpsTracker(window_sec=60)
+            try:
+                self.pps.start(self.tty_path)
+            except OSError as e:
+                log.warning("PPS tracker on %s failed: %s", self.tty_path, e)
+                self.pps = None
+
+    def stop(self) -> None:
+        if self.nmea is not None:
+            self.nmea.stop()
+            self.nmea = None
+        if self.pps is not None:
+            self.pps.stop()
+            self.pps = None
+
+    # --- per-tick data --------------------------------------------------
+
+    def build_report(self, *, host: str, now: float) -> DeviceReport:
+        with open_model(self.candidate) as model:
+            raw = model.get_status()
+            # MON-VER is slow (several hundred ms) and the answer never
+            # changes, so we try once and cache. Subsequent ticks reuse
+            # the cached string.
+            if (not self.mon_ver_tried
+                    and model.capabilities.has_ubx_mon_ver):
+                self.mon_ver_tried = True
+                try:
+                    mv = model.read_mon_ver(timeout_sec=5.0)
+                except Exception:
+                    log.exception("MON-VER poll failed for %s",
+                                  self.candidate.serial)
+                    mv = None
+                if mv is not None:
+                    parts = [f"SW={mv.sw_version}", f"HW={mv.hw_version}"]
+                    if mv.protver is not None:
+                        parts.append(f"PROTVER={mv.protver}")
+                    self.firmware = " ".join(parts)
+                    self.firmware_source = "ubx-mon-ver"
+                    self.firmware_advisory = lookup_protver(mv.protver)
+
+        # NMEA enrichment: fresh snapshot for the tick.
+        if self.nmea is not None:
+            ns = self.nmea.snapshot()
+            raw.health.gps_fix = ns.gps_fix
+            raw.health.sats_used = ns.sats_used
+            raw.health.fix_age_sec = ns.fix_age_sec(now=now)
+
+        # PPS study: snapshot the rolling window. If tracker isn't
+        # running (no CDC, or device config disabled it) fall back to a
+        # disabled marker so consumers can tell the difference between
+        # "not tracking" and "tracking with zero edges" (which IS a
+        # downgrade signal).
+        if self.pps is not None:
+            pps_study = self.pps.snapshot()
+        else:
+            pps_study = PpsStudy(enabled=False, window_sec=60)
+
+        if self.firmware is not None:
+            raw.firmware = self.firmware
+            raw.firmware_source = self.firmware_source
+
+        probe_age_sec = 0.0   # we just read; age is ~0 by construction
+
+        a_level, reason = classify(
+            raw.health,
+            pps_study,
+            probe_age_sec=probe_age_sec,
+            probe_interval_sec=self.cfg.probe_interval_sec,
+            pps_expected=bool(raw.outputs.pps_enabled),
+        )
+
+        device = Device(
+            model=self.candidate.model,
+            pid=f"{self.candidate.pid:#06x}",
+            serial=self.candidate.serial or "unknown",
+            hid_path=self.candidate.path.decode(errors="replace"),
+            firmware=raw.firmware,
+            firmware_source=raw.firmware_source,
+            raw_trailing_hex=raw.raw_trailing_hex,
+        )
+
+        return new_report(
+            host=host,
+            probe_interval_sec=self.cfg.probe_interval_sec,
+            device=device,
+            governs=list(self.declared.governs),
+            health=raw.health,
+            outputs=raw.outputs,
+            pps_study=pps_study,
+            a_level_hint=a_level,
+            a_level_reason=reason,
+            firmware_advisory=self.firmware_advisory,
+        )
+
+
+# --- Service ------------------------------------------------------------
+
+
 class Service:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
         self.stopping = threading.Event()
-        self.advertiser: Advertiser | None = None
-        self._last_written: dict[str, float] = {}   # serial → monotonic()
+        self.advertiser: Optional[Advertiser] = None
+        self._workers: dict[str, DeviceWorker] = {}
+        self._last_report_hint: dict[str, str] = {}
 
-    # --- Lifecycle -----------------------------------------------------
+    # --- lifecycle -----------------------------------------------------
+
     def start(self) -> None:
         self.cfg.run_dir.mkdir(parents=True, exist_ok=True)
         if self.cfg.mdns_enabled:
-            self.advertiser = Advertiser()
+            try:
+                self.advertiser = Advertiser()
+            except Exception:
+                log.exception("mDNS advertiser init failed; continuing without it")
+                self.advertiser = None
         signal.signal(signal.SIGTERM, self._on_signal)
         signal.signal(signal.SIGINT, self._on_signal)
 
     def stop(self) -> None:
         self.stopping.set()
+        for w in self._workers.values():
+            w.stop()
+        self._workers.clear()
         if self.advertiser is not None:
             self.advertiser.close()
             self.advertiser = None
@@ -69,13 +239,17 @@ class Service:
         log.info("signal received, shutting down")
         self.stopping.set()
 
-    # --- Probe loop ----------------------------------------------------
+    # --- probe loop ----------------------------------------------------
+
     def run(self) -> int:
         self.start()
         try:
             while not self.stopping.is_set():
                 started = time.monotonic()
-                self._tick()
+                try:
+                    self._tick()
+                except Exception:
+                    log.exception("probe tick failed")
                 elapsed = time.monotonic() - started
                 self.stopping.wait(max(0.0, self.cfg.probe_interval_sec - elapsed))
         finally:
@@ -86,87 +260,94 @@ class Service:
         result = match(self.cfg.devices)
         for err in result.errors:
             log.error("discovery: %s", err)
-        self._write_reports(result)
-        self._write_index(result)
+        self._sync_workers(result)
+        reports = self._write_reports(result)
+        self._write_index(result, reports)
         self._reap_advertisements(result)
 
-    # --- Per-device report --------------------------------------------
-    def _write_reports(self, result: DiscoveryResult) -> None:
+    # --- workers -------------------------------------------------------
+
+    def _sync_workers(self, result: DiscoveryResult) -> None:
+        """Create workers for newly-appeared devices, drop workers for
+        vanished ones."""
+        present_by_key = {
+            self._key(candidate): (declared, candidate)
+            for declared, candidate in result.matched
+        }
+        # Stop workers whose device vanished.
+        for key in list(self._workers.keys()):
+            if key not in present_by_key:
+                log.info("device %s vanished; stopping worker", key)
+                self._workers.pop(key).stop()
+        # Start workers for new devices.
+        for key, (declared, candidate) in present_by_key.items():
+            if key in self._workers:
+                # Refresh declared config in case governs changed.
+                self._workers[key].declared = declared
+                continue
+            log.info("device %s %s appeared; starting worker",
+                     candidate.model, key)
+            w = DeviceWorker(candidate=candidate, declared=declared, cfg=self.cfg)
+            w.start()
+            self._workers[key] = w
+
+    @staticmethod
+    def _key(candidate: HidCandidate) -> str:
+        return candidate.serial or candidate.path.decode(errors="replace")
+
+    # --- reports -------------------------------------------------------
+
+    def _write_reports(self, result: DiscoveryResult) -> dict[str, DeviceReport]:
         host = socket.getfqdn() or socket.gethostname()
+        now = time.time()
+        out: dict[str, DeviceReport] = {}
         for declared, candidate in result.matched:
+            key = self._key(candidate)
+            worker = self._workers.get(key)
+            if worker is None:
+                continue
             try:
-                report = self._build_report(host, declared, candidate)
+                report = worker.build_report(host=host, now=now)
             except NotImplementedError as e:
-                log.warning("skip %s: %s", candidate.serial or candidate.path, e)
+                log.warning("skip %s: %s", key, e)
                 continue
             except Exception:
-                log.exception("probe failed for %s", candidate.serial)
+                log.exception("probe failed for %s", key)
                 continue
             self._publish_report(report)
-
-    def _build_report(
-        self,
-        host: str,
-        declared,
-        candidate: HidCandidate,
-    ) -> DeviceReport:
-        with open_model(candidate) as model:
-            raw = model.get_status()
-
-        device = Device(
-            model=candidate.model,
-            pid=f"{candidate.pid:#06x}",
-            serial=candidate.serial or "unknown",
-            hid_path=candidate.path.decode(errors="replace"),
-            firmware=raw.firmware,
-            firmware_source=raw.firmware_source,
-            raw_trailing_hex=raw.raw_trailing_hex,
-        )
-
-        pps_study = PpsStudy(
-            enabled=self.cfg.pps_study_enabled
-                    and bool(raw.outputs.pps_enabled),
-            window_sec=60,
-        )
-
-        a_level, reason = classify(
-            raw.health,
-            pps_study,
-            probe_age_sec=0.0,
-            probe_interval_sec=self.cfg.probe_interval_sec,
-            pps_expected=bool(raw.outputs.pps_enabled),
-        )
-
-        return new_report(
-            host=host,
-            probe_interval_sec=self.cfg.probe_interval_sec,
-            device=device,
-            governs=list(declared.governs),
-            health=raw.health,
-            outputs=raw.outputs,
-            pps_study=pps_study,
-            a_level_hint=a_level,
-            a_level_reason=reason,
-        )
+            out[key] = report
+        return out
 
     def _publish_report(self, report: DeviceReport) -> None:
-        path = self.cfg.run_dir / f"{_sanitize(report.device.serial)}.json"
+        filename = f"{_sanitize(report.device.serial)}.json"
+        path = self.cfg.run_dir / filename
         atomic_write(str(path), report.to_json())
-        self._last_written[report.device.serial] = time.monotonic()
+        self._last_report_hint[report.device.serial] = report.a_level_hint
         if self.advertiser is not None:
-            self.advertiser.publish(report, probe_age_sec=0.0)
+            try:
+                self.advertiser.publish(report, probe_age_sec=0.0)
+            except Exception:
+                log.exception("mDNS publish failed for %s", report.device.serial)
 
-    # --- Index file ----------------------------------------------------
-    def _write_index(self, result: DiscoveryResult) -> None:
+    # --- index ---------------------------------------------------------
+
+    def _write_index(
+        self,
+        result: DiscoveryResult,
+        reports: dict[str, DeviceReport],
+    ) -> None:
         host = socket.getfqdn() or socket.gethostname()
-        entries = []
+        entries: list[IndexEntry] = []
         for declared, candidate in result.matched:
+            key = self._key(candidate)
+            r = reports.get(key)
             entries.append(IndexEntry(
                 serial=candidate.serial or "unknown",
                 model=candidate.model,
                 governs=list(declared.governs),
-                a_level_hint="A1",  # refined once per-report path lands
-                written_utc=utc_now_iso(),
+                a_level_hint=(r.a_level_hint if r is not None
+                              else self._last_report_hint.get(candidate.serial, "A0")),
+                written_utc=(r.written_utc if r is not None else utc_now_iso()),
             ))
         idx = IndexFile(
             schema=SCHEMA_VERSION,
@@ -177,16 +358,16 @@ class Service:
         atomic_write(str(self.cfg.run_dir / "index.json"), idx.to_json())
 
     # --- mDNS reaping --------------------------------------------------
+
     def _reap_advertisements(self, result: DiscoveryResult) -> None:
         if self.advertiser is None:
             return
-        present_serials = {c.serial for _, c in result.matched}
-        for serial in list(self._last_written.keys()):
+        present_serials = {c.serial for _, c in result.matched if c.serial}
+        for serial in list(self._last_report_hint.keys()):
             if serial not in present_serials:
                 log.info("device %s vanished; withdrawing advertisement", serial)
-                self.advertiser.withdraw(serial)
-                self._last_written.pop(serial, None)
-
-
-def _sanitize(serial: str) -> str:
-    return "".join(c if c.isalnum() or c in "-_" else "-" for c in serial) or "unknown"
+                try:
+                    self.advertiser.withdraw(serial)
+                except Exception:
+                    log.exception("mDNS withdraw failed for %s", serial)
+                self._last_report_hint.pop(serial, None)

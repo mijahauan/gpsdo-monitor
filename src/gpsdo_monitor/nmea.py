@@ -14,6 +14,7 @@ upstream is kept as a last-resort fallback.
 """
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -164,10 +165,9 @@ def sample(
     """One-shot NMEA sampler — open the port, read lines for up to
     `duration_sec`, return accumulated state.
 
-    Intended for the `gpsdo-monitor status` command and the daemon's
-    10 s probe tick. The daemon's long-running PPS edge thread
-    (pps.py) keeps the port open continuously; this function is the
-    cheap one-shot path for callers that don't need edge capture."""
+    Intended for the `gpsdo-monitor status` command. For the daemon,
+    use `NmeaReader` (below) which keeps the state fresh in a background
+    thread so each probe tick can snapshot without blocking."""
     import serial  # pyserial; imported lazily so unit tests don't need it
 
     state = NmeaState()
@@ -187,3 +187,113 @@ def sample(
             if line.startswith("$"):
                 feed(state, line)
     return state
+
+
+# --- Long-lived reader for the daemon ----------------------------------
+
+
+class NmeaReader:
+    """Background-thread NMEA reader — keeps a fresh `NmeaState` for
+    consumers that poll it on their own cadence.
+
+    Opens the tty once, reads one line at a time, updates shared
+    state under a lock. `snapshot()` returns a cheap copy for the
+    daemon's probe tick. `start()` / `stop()` manage the worker
+    thread; `stop()` closes the serial port so the blocking readline
+    returns."""
+
+    def __init__(self, tty_path: Path, *, baudrate: int = 9600) -> None:
+        self.tty_path = Path(tty_path)
+        self.baudrate = baudrate
+        self._state = NmeaState()
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._serial = None  # type: ignore[assignment]
+        self._open_error: str | None = None
+
+    @property
+    def open_error(self) -> str | None:
+        """Reason the serial port failed to open, or None on success."""
+        return self._open_error
+
+    def start(self) -> None:
+        if self._thread is not None:
+            raise RuntimeError("NmeaReader already started")
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"nmea-{self.tty_path.name}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self, *, timeout_sec: float = 2.0) -> None:
+        self._stop.set()
+        s = self._serial
+        if s is not None:
+            # Closing the port makes the blocking readline return
+            # immediately so the worker can exit the loop.
+            try:
+                s.close()
+            except Exception:
+                pass
+        if self._thread is not None:
+            self._thread.join(timeout=timeout_sec)
+            self._thread = None
+
+    def snapshot(self) -> NmeaState:
+        """Return a shallow copy of the current state. Safe to call
+        from any thread; each call materialises a fresh dataclass."""
+        with self._lock:
+            return NmeaState(
+                gps_fix=self._state.gps_fix,
+                sats_used=self._state.sats_used,
+                last_rmc_valid_wall=self._state.last_rmc_valid_wall,
+                bad_checksum_count=self._state.bad_checksum_count,
+            )
+
+    def _run(self) -> None:
+        import serial  # pyserial; imported lazily
+
+        try:
+            self._serial = serial.Serial(
+                str(self.tty_path), baudrate=self.baudrate, timeout=0.2,
+                rtscts=False, dsrdtr=False,
+            )
+        except (OSError, serial.SerialException) as e:
+            self._open_error = f"{type(e).__name__}: {e}"
+            return
+
+        try:
+            while not self._stop.is_set():
+                try:
+                    raw = self._serial.readline()
+                except (OSError, serial.SerialException, TypeError):
+                    # Three failure modes lumped together because the
+                    # right response is the same — exit cleanly:
+                    #   - OSError: port vanished (device unplugged)
+                    #   - SerialException: pyserial surface of the above
+                    #   - TypeError: stop() closed the fd while the
+                    #     worker was blocked in readline; pyserial
+                    #     re-enters os.read with fd=None. The stop
+                    #     signal is already set, so bail.
+                    return
+                if not raw:
+                    continue
+                try:
+                    line = raw.decode("ascii", errors="replace").strip()
+                except UnicodeDecodeError:
+                    continue
+                if not line.startswith("$"):
+                    continue
+                with self._lock:
+                    feed(self._state, line)
+        finally:
+            s = self._serial
+            self._serial = None
+            if s is not None:
+                try:
+                    s.close()
+                except Exception:
+                    pass

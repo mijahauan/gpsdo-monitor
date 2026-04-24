@@ -29,8 +29,21 @@ def classify(
     """
     if not health.pll_locked:
         return "A0", "pll_unlocked"
-    if health.gps_fix not in ("2D", "3D"):
+    # Primary signal is the NMEA fix string (2D/3D). When it isn't
+    # available — LBE-1420 has no CDC NMEA stream; the 1421/1423 CDC
+    # port may be unreadable due to permissions or contention — we
+    # fall back to the HID status bitmap's GPS_LOCK bit. That's a
+    # coarser "GPS module reports lock" signal, but it's what the
+    # hardware itself reports when the antenna chain is working.
+    if health.gps_fix in ("2D", "3D"):
+        gps_bits_ok = True
+    elif health.gps_locked is True:
+        gps_bits_ok = True
+    else:
         return "A0", f"gps_fix={health.gps_fix or 'none'}"
+    if not gps_bits_ok:
+        # unreachable, kept for clarity
+        return "A0", "gps_unavailable"
     if health.antenna_ok is False:
         return "A0", "antenna_fault"
     if health.fix_age_sec is not None and health.fix_age_sec > FRESH_FIX_SEC:
@@ -40,7 +53,11 @@ def classify(
     if pps_expected and pps_study.enabled and pps_study.edges < MIN_EDGES_PER_WINDOW:
         return "A0", f"pps_silent (edges={pps_study.edges})"
 
-    bits = ["pll_locked", f"gps_fix={health.gps_fix}"]
+    bits = ["pll_locked"]
+    if health.gps_fix in ("2D", "3D"):
+        bits.append(f"gps_fix={health.gps_fix}")
+    else:
+        bits.append("gps_locked")
     if health.antenna_ok:
         bits.append("antenna_ok")
     if pps_expected:
