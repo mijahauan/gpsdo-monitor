@@ -4,65 +4,170 @@ Health monitor, mDNS advertiser, and configurator for
 [Leo Bodnar](http://www.leobodnar.com/) GPS-disciplined clock sources
 (LBE-1420, LBE-1421, LBE-1423, LBE-Mini).
 
-Built to plug into the [HamSCI](https://hamsci.org) / `sigmond` SDR
-management suite and supply an **actively probed A-level** signal to
-`hf-timestd`'s authority manager — closing the "GPSDO is hopefully still
-disciplining the RX888 ADC" gap — but the daemon stands alone and emits a
-simple file + mDNS contract any consumer can read.
+Built for the [HamSCI](https://hamsci.org) / sigmond SDR station suite:
+supplies an **actively probed A-level** signal to
+[`hf-timestd`](https://github.com/mijahauan/hf-timestd)'s authority
+manager — closing the "GPSDO is *probably* still disciplining the RX888
+ADC" gap — but the daemon stands alone and emits a simple file + mDNS
+contract any consumer can read.
 
 ## Status
 
-Alpha / skeleton. Design sketch complete; protocol port from
-[bvernoux/lbe-142x](https://github.com/bvernoux/lbe-142x) in progress.
+Working on Linux (primary target: Debian 12 / RX888-class Beelink EQ).
+Live-validated on the LBE-1421; the LBE-1420 and LBE-Mini drivers are
+ported from [bvernoux/lbe-142x](https://github.com/bvernoux/lbe-142x)
+and covered by byte-level unit tests, but have not yet been exercised
+against live hardware.
 
 ## What it does
 
-1. **Detect** Leo Bodnar USB HID devices on the host (VID `0x1DD2`,
-   four known PIDs). Refuses to guess when more than one is attached
-   and no serial has been declared.
-2. **Probe** health at 10 s cadence — PLL lock, GPS fix, antenna
-   status, satellites used, fix age, output frequencies, 1PPS
-   present/absent, Mini-specific signal-loss count.
-3. **Publish** per-device state to `/run/gpsdo/<serial>.json` (schema
-   v1, atomic write), and advertise over mDNS as `_gpsdo._tcp` so
-   remote consumers (splitter-fed topologies) can read health without
-   SSH.
-4. **Advise** — emits `a_level_hint` (`A1` / `A0`) and a human-readable
-   reason; on the Mini, parses UBX-MON-VER to report u-blox module
-   firmware and flag outdated PROTVER.
-5. **Configure** — set output frequencies, PPS on/off, PLL/FLL mode,
+1. **Detect** attached Leo Bodnar USB HIDs (VID `0x1DD2`, four known
+   PIDs). Refuses to guess when more than one is attached and no
+   serial has been declared.
+2. **Probe** health at 10 s cadence — PLL lock, GPS fix (from NMEA on
+   1421/1423 or NAV-PVT on Mini), antenna status, satellites used, fix
+   age, output frequencies, 1 PPS presence, Mini signal-loss count.
+3. **Publish** per-device state atomically to
+   `/run/gpsdo/<serial>.json` (schema v1), plus an aggregate
+   `/run/gpsdo/index.json` for TUI consumption.
+4. **Advertise** over mDNS as `_gpsdo._tcp` so remote consumers
+   (splitter-fed topologies) can read health without SSH.
+5. **Advise** — emits `a_level_hint` (`A1` / `A0`) with a
+   human-readable reason, and on the Mini parses UBX-MON-VER to report
+   u-blox module firmware and flag outdated PROTVER.
+6. **Configure** — set output frequencies, PPS on/off, PLL/FLL mode,
    drive strength (Mini). Primary surface is `smd gpsdo config` in
-   `sigmond`; `gpsdo-monitor config …` is the secondary standalone
-   path for manual debugging.
+   sigmond; `gpsdo-monitor config …` is the manual-debugging path.
 
 ## What it does *not* do
 
 - It is **not** a metrology reference. The PPS stability numbers it
-  publishes are OS-millisecond bound (via TIOCMIWAIT on the CDC DCD
-  line) and serve as a liveness + gross-stability indicator only.
+  publishes are OS-millisecond bound (via `TIOCMIWAIT` on the CDC DCD
+  line) and serve only as a liveness + gross-stability indicator.
+  Every `pps_study` block carries that warning verbatim in its `note`
+  field.
 - It does not discipline the host system clock. That's chrony's job.
-- It does not reverse-engineer undocumented opcodes — it stays within
-  the feature-report layouts documented by lbe-142x.
+- It does not reverse-engineer undocumented HID opcodes — it stays
+  within the feature-report layouts documented by lbe-142x.
+
+## Hardware support matrix
+
+| Feature            | LBE-1420 | LBE-1421 | LBE-1423 | LBE-Mini |
+|--------------------|:--------:|:--------:|:--------:|:--------:|
+| HID status parse   | ✓        | ✓        | ✓        | ✓        |
+| NMEA fix / sats    | —        | ✓ CDC    | ✓ CDC    | ✓ NAV-PVT |
+| 1 PPS edge capture | —        | ✓ DCD    | ✓ DCD    | —        |
+| Firmware advisory  | —        | —        | —        | ✓ MON-VER |
+| OUT2               | —        | ✓        | ✓        | —        |
+| Drive strength (mA)| —        | —        | —        | 8/16/24/32 |
+| Max output         | 1.6 GHz  | 1.4 GHz  | 1.4 GHz  | 810 MHz  |
+
+`set_frequency` is implemented for the 142x family. On the Mini it
+requires the Si5351 divider-chain solver from upstream `mini_solve_pll`
+and is currently `NotImplementedError` until that's ported and live-
+validated.
+
+## Install
+
+### Under sigmond (preferred)
+
+```sh
+sudo smd install gpsdo-monitor
+```
+
+The catalog entry in
+[`sigmond/etc/catalog.toml`](https://github.com/mijahauan/sigmond/blob/main/etc/catalog.toml)
+clones this repo to `/opt/git/gpsdo-monitor` and runs `install.sh`.
+Add `[component.gpsdo-monitor] enabled = true` to
+`/etc/sigmond/topology.toml` if you want the full-suite walk (`smd
+install` without args) to include it.
+
+### Standalone
+
+```sh
+git clone https://github.com/mijahauan/gpsdo-monitor /opt/git/gpsdo-monitor
+sudo /opt/git/gpsdo-monitor/install.sh
+```
+
+The installer is idempotent and sets up:
+
+- `libhidapi-hidraw0` from apt (if available);
+- `gpsdo` system user + group via `systemd-sysusers`;
+- `/etc/udev/rules.d/99-gpsdo.rules` so members of `gpsdo` can access
+  `/dev/hidraw*` and `/dev/ttyACM*` for VID `0x1dd2`;
+- `pip install` of this package into the system Python;
+- `gpsdo-monitor.service` (enabled + started);
+- a default `/etc/gpsdo-monitor/config.toml` (preserves any existing
+  one).
+
+## Usage
+
+```sh
+gpsdo-monitor detect               # enumerate attached devices
+gpsdo-monitor status               # one-shot JSON: HID + NMEA + PPS sample
+gpsdo-monitor status --pps-sample-sec 0   # HID + NMEA only (no 3 s PPS count)
+gpsdo-monitor tui                  # live Textual view (requires [tui] extra)
+gpsdo-monitor tui --serial XXX     # focus on one device in a multi-GPSDO host
+sudo systemctl status gpsdo-monitor   # the daemon (written by install.sh)
+```
+
+The TUI is in the `[tui]` optional extra:
+
+```sh
+pip install 'gpsdo-monitor[tui]'
+```
+
+It mirrors the ka9q-python pattern — sigmond's radiod screen has a
+"Deep dive (gpsdo tui)" button that suspends the sigmond app and
+shells out to `gpsdo-monitor tui`, passing `--serial` when a
+`/run/gpsdo/*.json` declares it governs the selected radiod.
 
 ## Topology combinations supported
 
-| Case | Description | Configuration |
-|------|-------------|---------------|
-| A | 1 GPSDO → 1 RX888 → 1 host (default) | autodetect, no explicit config |
-| B | N GPSDOs on one host, each governing one radiod | declare `[[device]]` entries with `serial` + `governs` |
-| C | N GPSDOs on N hosts | run gpsdo-monitor on each host; consumers use mDNS |
-| D | 1 GPSDO → splitter → N RX888s (on one or more hosts) | single instance, `governs = ["radiod:a", "radiod:b", …]` |
-| E | No GPSDO (dev / degraded) | not installed; consumers fall back to config-declared A-level |
+| Case | Description                                               | Configuration |
+|------|-----------------------------------------------------------|---------------|
+| A    | 1 GPSDO → 1 RX888 → 1 host (default)                      | autodetect, no explicit config |
+| B    | N GPSDOs on one host, each governing one radiod           | `[[monitor.device]]` with `serial` + `governs` |
+| C    | N GPSDOs on N hosts                                       | run gpsdo-monitor on each host; consumers use mDNS |
+| D    | 1 GPSDO → splitter → N RX888s (same or different hosts)   | single instance, `governs = ["radiod:a", "radiod:b", …]` |
+| E    | No GPSDO (dev / degraded)                                 | not installed; consumers fall back to config-declared A-level |
 
-See [docs/TOPOLOGY.md](docs/TOPOLOGY.md) for concrete examples.
+See [docs/TOPOLOGY.md](docs/TOPOLOGY.md) for concrete examples and
+[docs/SCHEMA-v1.md](docs/SCHEMA-v1.md) for the full contract.
+
+## Integration
+
+- **[hf-timestd](https://github.com/mijahauan/hf-timestd)**: when
+  `[timing.authority_manager.gpsdo].enabled = true`, hf-timestd's
+  `GpsdoProbe` reads `/run/gpsdo/*.json` every authority tick and
+  supplies the `a_level_provider` that decides A1 vs A0. Any fresh
+  device reporting `a_level_hint == "A1"` is sufficient; the authority
+  manager cross-checks against T-level witnesses and can override.
+- **[sigmond](https://github.com/mijahauan/sigmond)**: the `harmonize`
+  rule `gpsdo_governor_coverage` reads the same JSON drop and enforces
+  exactly-one-governor-per-local-radiod (zero warns, multiple errors)
+  on every `smd validate`. The TUI radiod screen has a deep-dive
+  button into this repo's own TUI (see above).
+
+## Development
+
+```sh
+uv sync --extra dev --extra tui     # or: pip install -e '.[dev,tui]'
+uv run pytest -q                    # 99 tests; unit only, no hardware
+```
+
+The daemon path uses a fake pyserial + fake hidapi in
+[`tests/test_service.py`](tests/test_service.py) to drive a full
+`Service._tick()` against a simulated 1421, so CI can validate the
+full composition without USB hardware.
 
 ## Credit
 
 The USB HID opcodes, feature-report layouts, model-PID mapping, NMEA
 monitor, and UBX stream parsing in this project are ports of the
 documentation and reference implementation in
-[bvernoux/lbe-142x](https://github.com/bvernoux/lbe-142x) (MIT).
-We stay wire-compatible with that tool and credit it as the canonical
+[bvernoux/lbe-142x](https://github.com/bvernoux/lbe-142x) (MIT). We
+stay wire-compatible with that tool and credit it as the canonical
 protocol reference.
 
 Earlier protocol work by Simon Unsworth
