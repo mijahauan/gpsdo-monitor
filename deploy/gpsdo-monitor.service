@@ -1,0 +1,31 @@
+[Unit]
+Description=Leo Bodnar GPSDO Monitor
+Documentation=https://github.com/mijahauan/gpsdo-monitor
+After=systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+
+[Service]
+Type=simple
+User=gpsdo
+Group=gpsdo
+# SupplementaryGroups=dialout
+ExecStart=/usr/local/bin/gpsdo-monitor serve
+Restart=on-failure
+RestartSec=5
+RuntimeDirectory=gpsdo
+RuntimeDirectoryMode=0755
+# Hardening — the daemon needs HID (/dev/hidraw*) and optionally CDC
+# (/dev/ttyACM*); everything else stays locked down.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=false
+DeviceAllow=char-hidraw rw
+DeviceAllow=char-ttyACM rw
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+
+[Install]
+WantedBy=multi-user.target

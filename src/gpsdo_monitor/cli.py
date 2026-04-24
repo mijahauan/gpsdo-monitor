@@ -1,0 +1,108 @@
+"""Secondary-surface CLI.
+
+Primary operator interface is `smd gpsdo ...` in sigmond. This CLI is
+for manual debugging, first-time bring-up, and anyone who wants to use
+gpsdo-monitor outside a sigmond-managed station.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import sys
+from pathlib import Path
+
+from gpsdo_monitor import __version__
+from gpsdo_monitor.config import Config
+from gpsdo_monitor.discovery import match
+from gpsdo_monitor.hid_xport import enumerate_lbe
+from gpsdo_monitor.models import open_model
+
+
+def _setup_logging(verbose: bool) -> None:
+    logging.basicConfig(
+        level=logging.DEBUG if verbose else logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    )
+
+
+def _cmd_detect(_args: argparse.Namespace) -> int:
+    present = enumerate_lbe()
+    if not present:
+        print("no Leo Bodnar devices found", file=sys.stderr)
+        return 1
+    for c in present:
+        print(f"{c.model:10s}  pid={c.pid:#06x}  serial={c.serial!r:24s}  path={c.path.decode(errors='replace')}")
+    return 0
+
+
+def _cmd_status(args: argparse.Namespace) -> int:
+    cfg = Config.from_file(Path(args.config) if args.config else None)
+    result = match(cfg.devices)
+    for err in result.errors:
+        print(f"error: {err}", file=sys.stderr)
+    if not result.matched:
+        return 1
+    for declared, candidate in result.matched:
+        try:
+            with open_model(candidate) as model:
+                raw = model.get_status()
+        except NotImplementedError as e:
+            print(f"{candidate.model}  {candidate.serial}: {e}", file=sys.stderr)
+            continue
+        print(json.dumps({
+            "model": candidate.model,
+            "serial": candidate.serial,
+            "declared_governs": list(declared.governs),
+            "health": raw.health.__dict__,
+            "outputs": raw.outputs.__dict__,
+            "firmware": raw.firmware,
+            "firmware_source": raw.firmware_source,
+        }, indent=2))
+    return 0
+
+
+def _cmd_serve(args: argparse.Namespace) -> int:
+    from gpsdo_monitor.service import Service
+    cfg = Config.from_file(Path(args.config) if args.config else None)
+    return Service(cfg).run()
+
+
+def _cmd_config(args: argparse.Namespace) -> int:
+    # Placeholder — primary path is `smd gpsdo config`. Keeping this
+    # stub so the parser documents the intended surface.
+    print("not implemented: use `smd gpsdo config …` as the primary surface,", file=sys.stderr)
+    print("or see `gpsdo-monitor config --help` for standalone options.", file=sys.stderr)
+    return 2
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="gpsdo-monitor",
+        description="Leo Bodnar GPSDO health monitor (secondary CLI; primary surface is `smd gpsdo`).",
+    )
+    p.add_argument("-V", "--version", action="version", version=f"gpsdo-monitor {__version__}")
+    p.add_argument("-v", "--verbose", action="store_true")
+    p.add_argument("-c", "--config", help="path to config.toml (default /etc/gpsdo-monitor/config.toml)")
+
+    sub = p.add_subparsers(dest="command", required=True)
+
+    sp = sub.add_parser("detect", help="enumerate attached Leo Bodnar devices")
+    sp.set_defaults(func=_cmd_detect)
+
+    sp = sub.add_parser("status", help="one-shot health + output dump, JSON per device")
+    sp.set_defaults(func=_cmd_status)
+
+    sp = sub.add_parser("serve", help="run the long-lived probe daemon (systemd)")
+    sp.set_defaults(func=_cmd_serve)
+
+    sp = sub.add_parser("config", help="configure a device (placeholder; use `smd gpsdo config`)")
+    sp.set_defaults(func=_cmd_config)
+
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    _setup_logging(args.verbose)
+    return args.func(args)

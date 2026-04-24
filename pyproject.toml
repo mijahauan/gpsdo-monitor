@@ -1,0 +1,59 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gpsdo-monitor"
+version = "0.1.0"
+description = "Health monitor, mDNS advertiser, and configurator for Leo Bodnar GPSDO clocks (LBE-1420/1421/1423/Mini)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [
+    { name = "Michael Hauan", email = "michael.j.hauan@gmail.com" },
+]
+keywords = ["gpsdo", "leo-bodnar", "lbe-1421", "lbe-mini", "hamsci", "hf-timestd", "sigmond"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: System :: Hardware",
+    "Topic :: Scientific/Engineering",
+]
+
+dependencies = [
+    "hidapi>=0.14",
+    "zeroconf>=0.131",
+    "pyserial>=3.5",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-cov>=5",
+    "ruff>=0.5",
+]
+
+[project.scripts]
+gpsdo-monitor = "gpsdo_monitor.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/mijahauan/gpsdo-monitor"
+Issues   = "https://github.com/mijahauan/gpsdo-monitor/issues"
+"HID protocol reference" = "https://github.com/bvernoux/lbe-142x"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+gpsdo_monitor = ["data/*.toml"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

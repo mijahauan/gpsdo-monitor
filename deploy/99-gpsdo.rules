@@ -1,0 +1,10 @@
+# udev rules for Leo Bodnar GPSDOs (VID 0x1dd2)
+#
+# Grants the `gpsdo` group read/write access to the HID node and the
+# CDC ACM port (1421/1423 NMEA + 1PPS carrier).
+
+# HID feature-report channel (all variants)
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1dd2", MODE="0660", GROUP="gpsdo"
+
+# CDC ACM — 1421/1423 stream NMEA here and carry 1PPS on DCD
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1dd2", MODE="0660", GROUP="gpsdo"

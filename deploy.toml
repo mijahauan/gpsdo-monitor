@@ -1,0 +1,15 @@
+# Sigmond deploy manifest for gpsdo-monitor.
+#
+# gpsdo-monitor is an `infra` client (like igmp-querier) — it does not
+# conform to the v0.4 client contract (no inventory/validate
+# subcommands), but sigmond can still install, start, stop, and
+# monitor its one systemd unit.
+
+schema = "0.5"
+name   = "gpsdo-monitor"
+kind   = "infra"
+
+[units.gpsdo-monitor]
+type        = "static"
+unit        = "gpsdo-monitor.service"
+description = "Leo Bodnar GPSDO health monitor + mDNS advertiser"

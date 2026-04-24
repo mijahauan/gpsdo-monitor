@@ -1,0 +1,29 @@
+# Data bundle: firmware advisories keyed by what gpsdo-monitor can actually read.
+#
+# Today, only the LBE-Mini exposes a readable firmware string (u-blox
+# UBX-MON-VER SW/HW/PROTVER extensions). The 1420/1421/1423 don't have
+# a documented firmware-readback opcode, so we can't drive advisory
+# logic for those variants programmatically — operators record the
+# host-firmware version in their site config manually.
+
+schema = "v1"
+
+# --- LBE-Mini u-blox module ------------------------------------------
+# PROTVER is the most operationally-relevant knob: it gates which UBX
+# messages the GPS module understands. Anything >= 18 supports NAV-SAT
+# (what the Mini uses for per-SV CNR); older modules can still be used
+# but operator visibility is limited.
+[[ubx.protver]]
+match  = "^18\\."
+status = "current"
+notes  = "u-blox M8 PROTVER 18.xx — supports NAV-SAT, NAV-CLOCK, fully featured."
+
+[[ubx.protver]]
+match  = "^(1[0-7])\\."
+status = "outdated"
+notes  = "u-blox 7/M8 PROTVER <18 — NAV-SAT not supported; NAV-SVINFO fallback needed. Consider a newer module."
+
+[[ubx.protver]]
+match  = "^(2[0-9]|3[0-9])\\."
+status = "current"
+notes  = "u-blox M9/M10/F9 — newer than the Mini was originally characterized for, but protocol-compatible."

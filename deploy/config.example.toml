@@ -1,0 +1,26 @@
+# /etc/gpsdo-monitor/config.toml — example
+#
+# The [[monitor.device]] list is the source of truth for the
+# GPSDO → radiod governance map. If you omit it and exactly one
+# Leo Bodnar device is attached, the daemon autodetects (Case A).
+
+[monitor]
+probe_interval_sec = 10
+run_dir            = "/run/gpsdo"
+pps_study_enabled  = true
+mdns_enabled       = true
+
+# Case B — two GPSDOs on one host, each governing one radiod:
+# [[monitor.device]]
+# serial  = "LBE1421-ABC123"
+# governs = ["radiod:main"]
+#
+# [[monitor.device]]
+# serial  = "LBE1420-XYZ789"
+# governs = ["radiod:aux"]
+
+# Case D — one GPSDO through a splitter feeding multiple radiods
+# (possibly on different hosts):
+# [[monitor.device]]
+# serial  = "LBE1421-SHARED"
+# governs = ["radiod:main", "radiod:aux", "radiod:host2-main"]
