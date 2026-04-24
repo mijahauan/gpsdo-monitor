@@ -13,7 +13,7 @@ contract any consumer can read.
 
 ## Status
 
-Working on Linux (primary target: Debian 12 / RX888-class Beelink EQ).
+Working on Linux (primary target: Debian 12+ / RX888-class Beelink EQ).
 Live-validated on the LBE-1421; the LBE-1420 and LBE-Mini drivers are
 ported from [bvernoux/lbe-142x](https://github.com/bvernoux/lbe-142x)
 and covered by byte-level unit tests, but have not yet been exercised
@@ -151,6 +151,8 @@ See [docs/TOPOLOGY.md](docs/TOPOLOGY.md) for concrete examples and
 
 ## Development
 
+### Local-only iteration (no systemd)
+
 ```sh
 uv sync --extra dev --extra tui     # or: pip install -e '.[dev,tui]'
 uv run pytest -q                    # 99 tests; unit only, no hardware
@@ -160,6 +162,59 @@ The daemon path uses a fake pyserial + fake hidapi in
 [`tests/test_service.py`](tests/test_service.py) to drive a full
 `Service._tick()` against a simulated 1421, so CI can validate the
 full composition without USB hardware.
+
+### Editable install on the station host
+
+Skip the push-and-reinstall dance when you're iterating against live
+hardware. `install.sh --dev` symlinks `/opt/git/gpsdo-monitor` at the
+checkout you ran it from and pip-installs editable:
+
+```sh
+sudo ~/git/gpsdo-monitor/install.sh --dev
+```
+
+End state: the systemd daemon runs from site-packages, whose `.pth`
+points at `/opt/git/gpsdo-monitor` (→ `~/git/gpsdo-monitor`). Edit
+Python, `sudo systemctl restart gpsdo-monitor.service`, done — no
+`pip install` between edit and restart. Sigmond's `smd install` /
+`smd status` / deploy.toml lookup all find the canonical symlink, so
+the rest of the suite sees a normal install.
+
+The `gpsdo` service user must be able to traverse your repo path. On
+a host with `/home/<you>` set to mode 700 (typical for shared
+machines), relocate the canonical checkout to `/opt/git/gpsdo-monitor`
+directly (owner = you, mode 755) and point a reverse symlink from
+`~/git/gpsdo-monitor` if you want the dev shortcut. `install.sh --dev`
+refuses to install into an unreadable tree.
+
+*Non-Python files that don't auto-reload — re-run `install.sh --dev`
+after editing any of these:*
+
+- `deploy/gpsdo-monitor.service` (systemd unit body)
+- `deploy/99-gpsdo.rules` (udev)
+- `deploy/sysusers.d/gpsdo.conf`
+- `pyproject.toml` (dependency changes)
+
+### Deploying changes to production
+
+When the station matters and copy-install discipline is desired,
+[`scripts/deploy.sh`](scripts/deploy.sh) is the equivalent of
+hf-timestd's pull-to-deploy:
+
+```sh
+# after committing locally and pushing:
+sudo /opt/git/gpsdo-monitor/scripts/deploy.sh --pull
+```
+
+The script refuses to run on a dirty tree (`--force-dirty` to bypass),
+verifies the service user can read the source after any `git pull`,
+refreshes the editable install, restarts the unit, and prints the
+deployed SHA. `--dry-run` shows what it *would* do without changing
+anything.
+
+The **clean-tree check is the point** — it makes "code was edited out
+of band" impossible to hide, which is how copy-install deployments
+quietly drift away from git.
 
 ## Credit
 
