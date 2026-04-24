@@ -17,6 +17,7 @@ from gpsdo_monitor.config import Config
 from gpsdo_monitor.discovery import match
 from gpsdo_monitor.hid_xport import enumerate_lbe
 from gpsdo_monitor.models import open_model
+from gpsdo_monitor.schema import PpsStudy
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -44,11 +45,15 @@ def _cmd_status(args: argparse.Namespace) -> int:
     if not result.matched:
         return 1
     for declared, candidate in result.matched:
+        pps_study = PpsStudy()
         try:
             with open_model(candidate) as model:
                 raw = model.get_status()
                 if model.capabilities.has_nmea_cdc and candidate.serial:
                     _enrich_with_nmea(raw, candidate.serial, args.nmea_sample_sec)
+                if (model.capabilities.has_pps and candidate.serial
+                        and args.pps_sample_sec > 0 and raw.outputs.pps_enabled):
+                    pps_study = _sample_pps(candidate.serial, args.pps_sample_sec)
         except NotImplementedError as e:
             print(f"{candidate.model}  {candidate.serial}: {e}", file=sys.stderr)
             continue
@@ -58,6 +63,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
             "declared_governs": list(declared.governs),
             "health": raw.health.__dict__,
             "outputs": raw.outputs.__dict__,
+            "pps_study": pps_study.__dict__,
             "firmware": raw.firmware,
             "firmware_source": raw.firmware_source,
         }, indent=2))
@@ -81,6 +87,22 @@ def _enrich_with_nmea(raw, serial: str, duration_sec: float) -> None:
     raw.health.gps_fix = st.gps_fix
     raw.health.sats_used = st.sats_used
     raw.health.fix_age_sec = st.fix_age_sec()
+
+
+def _sample_pps(serial: str, duration_sec: float) -> PpsStudy:
+    """Sample DCD 1PPS edges for `duration_sec` on the tty owned by
+    `serial`. Returns an empty PpsStudy if the tty can't be found or
+    opened — the caller still prints HID-derived output fields."""
+    from gpsdo_monitor.nmea import find_ttys_by_usb_serial
+    from gpsdo_monitor.pps import sample_pps
+    ttys = find_ttys_by_usb_serial(serial)
+    if not ttys:
+        return PpsStudy()
+    try:
+        return sample_pps(ttys[0], duration_sec=duration_sec)
+    except OSError as e:
+        logging.getLogger(__name__).warning("PPS sample on %s failed: %s", ttys[0], e)
+        return PpsStudy()
 
 
 def _cmd_serve(args: argparse.Namespace) -> int:
@@ -115,6 +137,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument(
         "--nmea-sample-sec", type=float, default=1.5,
         help="seconds to listen on CDC for NMEA before reporting (default 1.5)",
+    )
+    sp.add_argument(
+        "--pps-sample-sec", type=float, default=3.0,
+        help="seconds to count DCD 1PPS edges before reporting (default 3.0; 0 disables)",
     )
     sp.set_defaults(func=_cmd_status)
 
