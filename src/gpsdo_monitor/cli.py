@@ -132,6 +132,19 @@ def _cmd_serve(args: argparse.Namespace) -> int:
     return Service(cfg).run()
 
 
+def _cmd_tui(args: argparse.Namespace) -> int:
+    try:
+        from gpsdo_monitor.tui import run_tui
+    except ImportError as exc:
+        print(
+            f"TUI unavailable: {exc}\n"
+            "Install with: pip install 'gpsdo-monitor[tui]'",
+            file=sys.stderr,
+        )
+        return 2
+    return run_tui(serial=args.serial, refresh_sec=args.refresh_sec)
+
+
 def _cmd_config(args: argparse.Namespace) -> int:
     # Placeholder — primary path is `smd gpsdo config`. Keeping this
     # stub so the parser documents the intended surface.
@@ -167,6 +180,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("serve", help="run the long-lived probe daemon (systemd)")
     sp.set_defaults(func=_cmd_serve)
+
+    sp = sub.add_parser("tui", help="launch the Textual live-view TUI ([tui] extra)")
+    sp.add_argument("--serial", help="restrict to one device by serial")
+    sp.add_argument("--refresh-sec", type=float, default=1.0,
+                    help="refresh cadence in seconds (default 1.0)")
+    sp.set_defaults(func=_cmd_tui)
 
     sp = sub.add_parser("config", help="configure a device (placeholder; use `smd gpsdo config`)")
     sp.set_defaults(func=_cmd_config)

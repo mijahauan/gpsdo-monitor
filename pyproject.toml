@@ -36,6 +36,9 @@ dev = [
     "pytest-cov>=5",
     "ruff>=0.5",
 ]
+tui = [
+    "textual>=0.70",
+]
 
 [project.scripts]
 gpsdo-monitor = "gpsdo_monitor.cli:main"
