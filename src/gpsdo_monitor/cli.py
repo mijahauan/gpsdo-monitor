@@ -47,6 +47,8 @@ def _cmd_status(args: argparse.Namespace) -> int:
         try:
             with open_model(candidate) as model:
                 raw = model.get_status()
+                if model.capabilities.has_nmea_cdc and candidate.serial:
+                    _enrich_with_nmea(raw, candidate.serial, args.nmea_sample_sec)
         except NotImplementedError as e:
             print(f"{candidate.model}  {candidate.serial}: {e}", file=sys.stderr)
             continue
@@ -60,6 +62,25 @@ def _cmd_status(args: argparse.Namespace) -> int:
             "firmware_source": raw.firmware_source,
         }, indent=2))
     return 0
+
+
+def _enrich_with_nmea(raw, serial: str, duration_sec: float) -> None:
+    """Fill Health.gps_fix / sats_used / fix_age_sec from a short NMEA sample.
+
+    Silent no-op if we can't find a matching tty or the port refuses to
+    open — status should still report HID-derived health in that case."""
+    from gpsdo_monitor.nmea import find_ttys_by_usb_serial, sample
+    ttys = find_ttys_by_usb_serial(serial)
+    if not ttys:
+        return
+    try:
+        st = sample(ttys[0], duration_sec=duration_sec)
+    except OSError as e:
+        logging.getLogger(__name__).warning("NMEA sample on %s failed: %s", ttys[0], e)
+        return
+    raw.health.gps_fix = st.gps_fix
+    raw.health.sats_used = st.sats_used
+    raw.health.fix_age_sec = st.fix_age_sec()
 
 
 def _cmd_serve(args: argparse.Namespace) -> int:
@@ -91,6 +112,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=_cmd_detect)
 
     sp = sub.add_parser("status", help="one-shot health + output dump, JSON per device")
+    sp.add_argument(
+        "--nmea-sample-sec", type=float, default=1.5,
+        help="seconds to listen on CDC for NMEA before reporting (default 1.5)",
+    )
     sp.set_defaults(func=_cmd_status)
 
     sp = sub.add_parser("serve", help="run the long-lived probe daemon (systemd)")

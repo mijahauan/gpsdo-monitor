@@ -40,6 +40,7 @@ class Health:
     fix_age_sec: float | None = None
     antenna_ok: bool | None = None
     signal_loss_count: int | None = None
+    gps_locked: bool | None = None      # HID status bit 0: GPS module reports lock
 
 
 @dataclass

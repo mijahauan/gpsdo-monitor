@@ -6,7 +6,9 @@ wire format as the 1421 until evidence of divergence turns up.
 Status layout (Report ID 0x4B, 60 bytes):
 
   offset  size  field
-  1       1     status bitmap  (PLL_LOCK | ANT_OK | OUT1_EN | OUT2_EN | PPS_EN)
+  1       1     status bitmap  (bit0 GPS_LOCK, bit1 PLL_LOCK, bit2 ANT_OK,
+                               bit3 LED1, bit4 LED2, bit5 OUT1_EN,
+                               bit6 OUT2_EN, bit7 PPS_EN)
   6..9    4     frequency1 (Hz, u32 LE)
   14..17  4     frequency2 (Hz, u32 LE)
   18      1     FLL mode (0 PLL, 1 FLL)
@@ -26,26 +28,27 @@ from gpsdo_monitor.schema import Health, Outputs
 
 STATUS_REPORT_ID = 0x4B
 
-# Status bitmap (see lbe_common.h)
-PLL_LOCK_BIT = 0x01
-ANT_OK_BIT   = 0x02
-OUT1_EN_BIT  = 0x04
-OUT2_EN_BIT  = 0x08
-PPS_EN_BIT   = 0x10
+# Status bitmap (see lbe_common.h).
+GPS_LOCK_BIT = 1 << 0
+PLL_LOCK_BIT = 1 << 1
+ANT_OK_BIT   = 1 << 2
+LED1_BIT     = 1 << 3
+LED2_BIT     = 1 << 4
+OUT1_EN_BIT  = 1 << 5
+OUT2_EN_BIT  = 1 << 6
+PPS_EN_BIT   = 1 << 7
 
-# Opcodes (ported from upstream lbe_common.h — final list to verify
-# once we wire real hardware; scaffold uses placeholder names so tests
-# don't depend on specific byte values that may shift).
-OPC_EN_OUT       = 0x03
-OPC_BLINK        = 0x07
-OPC_SET_PLL      = 0x04
-OPC_SET_F1       = 0x10
-OPC_SET_F1_TEMP  = 0x11
-OPC_SET_F2       = 0x12
-OPC_SET_F2_TEMP  = 0x13
-OPC_SET_PWR1     = 0x14
-OPC_SET_PWR2     = 0x15
-OPC_SET_PPS      = 0x16
+# Opcodes (lbe_common.h).
+OPC_EN_OUT       = 0x01
+OPC_BLINK        = 0x02
+OPC_SET_F1_TEMP  = 0x05
+OPC_SET_F1       = 0x06
+OPC_SET_F2_TEMP  = 0x09
+OPC_SET_F2       = 0x0A
+OPC_SET_PLL      = 0x0B
+OPC_SET_PPS      = 0x0C
+OPC_SET_PWR1     = 0x0D
+OPC_SET_PWR2     = 0x0E
 
 
 def _u32_le(buf: bytes, off: int) -> int:
@@ -90,6 +93,7 @@ class Lbe1421(GpsdoModel):
                              == (OUT1_EN_BIT | OUT2_EN_BIT),
             fll_mode=fll,
             antenna_ok=bool(raw & ANT_OK_BIT),
+            gps_locked=bool(raw & GPS_LOCK_BIT),
             # NMEA fields (gps_fix, sats_used, fix_age_sec) filled in
             # by the CDC reader coroutine in nmea.py.
         )

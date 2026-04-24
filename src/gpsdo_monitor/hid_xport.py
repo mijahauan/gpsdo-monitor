@@ -66,7 +66,8 @@ class HidDevice:
     """
 
     def __init__(self, path: bytes) -> None:
-        self._d = hid.Device(path=path)
+        self._d = hid.device()
+        self._d.open_path(path)
         self._path = path
 
     @property
@@ -91,14 +92,20 @@ class HidDevice:
         self._d.send_feature_report(bytes([report_id]) + payload)
 
     def feature_get(self, report_id: int, length: int = REPORT_SIZE) -> bytes:
-        """Read a Feature report; returns `length` bytes of payload (no Report ID)."""
-        # hidapi returns report_id + payload; strip the leading byte.
-        buf = self._d.get_feature_report(report_id, length + 1)
-        return bytes(buf[1 : 1 + length])
+        """Read a Feature report. Returns a `length`-byte buffer whose indexing
+        matches upstream `lbe-142x/src/model_*.c`: buf[0] is the first byte
+        the device returns (an opcode/report-id echo on the 142x), so raw
+        status lives at buf[1], frequency at buf[6..9], etc."""
+        buf = self._d.get_feature_report(report_id, length)
+        if len(buf) != length:
+            raise OSError(
+                f"short feature-report read: got {len(buf)} bytes, expected {length}"
+            )
+        return bytes(buf)
 
     # --- Interrupt IN (Mini UBX stream) ---------------------------------
     def read(self, length: int, timeout_ms: int | None = None) -> bytes:
-        data = self._d.read(length, timeout_ms if timeout_ms is not None else -1)
+        data = self._d.read(length, timeout_ms if timeout_ms is not None else 0)
         return bytes(data or b"")
 
 
