@@ -46,6 +46,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
         return 1
     for declared, candidate in result.matched:
         pps_study = PpsStudy()
+        advisory = None
         try:
             with open_model(candidate) as model:
                 raw = model.get_status()
@@ -54,10 +55,12 @@ def _cmd_status(args: argparse.Namespace) -> int:
                 if (model.capabilities.has_pps and candidate.serial
                         and args.pps_sample_sec > 0 and raw.outputs.pps_enabled):
                     pps_study = _sample_pps(candidate.serial, args.pps_sample_sec)
+                if model.capabilities.has_ubx_mon_ver:
+                    advisory = _enrich_firmware(model, raw)
         except NotImplementedError as e:
             print(f"{candidate.model}  {candidate.serial}: {e}", file=sys.stderr)
             continue
-        print(json.dumps({
+        out = {
             "model": candidate.model,
             "serial": candidate.serial,
             "declared_governs": list(declared.governs),
@@ -66,7 +69,10 @@ def _cmd_status(args: argparse.Namespace) -> int:
             "pps_study": pps_study.__dict__,
             "firmware": raw.firmware,
             "firmware_source": raw.firmware_source,
-        }, indent=2))
+        }
+        if advisory is not None:
+            out["firmware_advisory"] = advisory.__dict__
+        print(json.dumps(out, indent=2))
     return 0
 
 
@@ -87,6 +93,21 @@ def _enrich_with_nmea(raw, serial: str, duration_sec: float) -> None:
     raw.health.gps_fix = st.gps_fix
     raw.health.sats_used = st.sats_used
     raw.health.fix_age_sec = st.fix_age_sec()
+
+
+def _enrich_firmware(model, raw):
+    """Try to read the GPS-module firmware via UBX-MON-VER and classify
+    it against the advisory table. Returns a FirmwareAdvisory or None
+    if the device didn't answer the poll."""
+    from gpsdo_monitor.advisories import lookup_protver
+    mv = model.read_mon_ver() if hasattr(model, "read_mon_ver") else None
+    if mv is None:
+        return None
+    raw.firmware = f"SW={mv.sw_version} HW={mv.hw_version}" + (
+        f" PROTVER={mv.protver}" if mv.protver else ""
+    )
+    raw.firmware_source = "ubx-mon-ver"
+    return lookup_protver(mv.protver)
 
 
 def _sample_pps(serial: str, duration_sec: float) -> PpsStudy:
