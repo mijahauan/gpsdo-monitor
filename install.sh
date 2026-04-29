@@ -8,7 +8,7 @@
 #   install.sh             # production install — copy pip install from
 #                          #   the repo directory into system Python.
 #   install.sh --dev       # development install — symlink
-#                          #   /opt/git/gpsdo-monitor to this repo so
+#                          #   /opt/git/sigmond/gpsdo-monitor to this repo so
 #                          #   sigmond's canonical-path logic finds it,
 #                          #   and use `pip install -e` so Python edits
 #                          #   take effect on `systemctl restart` with
@@ -22,7 +22,7 @@ CONF_DIR="${CONF_DIR:-/etc/gpsdo-monitor}"
 UDEV_DIR="${UDEV_DIR:-/etc/udev/rules.d}"
 SYSTEMD_DIR="${SYSTEMD_DIR:-/etc/systemd/system}"
 SYSUSERS_DIR="${SYSUSERS_DIR:-/etc/sysusers.d}"
-CANONICAL_DIR="${CANONICAL_DIR:-/opt/git/gpsdo-monitor}"
+CANONICAL_DIR="${CANONICAL_DIR:-/opt/git/sigmond/gpsdo-monitor}"
 SERVICE_USER="${SERVICE_USER:-gpsdo}"
 
 DEV_MODE=false
@@ -67,11 +67,11 @@ install_udev() {
 }
 
 install_canonical_symlink() {
-    # Dev mode only. Points /opt/git/gpsdo-monitor at this checkout so
+    # Dev mode only. Points /opt/git/sigmond/gpsdo-monitor at this checkout so
     # sigmond's deploy.toml lookup + the canonical-path convention keep
     # working without a second clone that would drift from the dev
     # tree. Refuses to clobber an existing real directory — a fresh
-    # production install should remove /opt/git/gpsdo-monitor first.
+    # production install should remove /opt/git/sigmond/gpsdo-monitor first.
     install -d -m 0755 "$(dirname "$CANONICAL_DIR")"
     if [[ -L "$CANONICAL_DIR" ]]; then
         local current target
@@ -109,7 +109,7 @@ verify_traversable() {
         echo "       one of the parent directories is not traversable" >&2
         echo "       (typically a home directory with mode 700)." >&2
         echo "" >&2
-        echo "       fix: relocate the repo to /opt/git/gpsdo-monitor" >&2
+        echo "       fix: relocate the repo to /opt/git/sigmond/gpsdo-monitor" >&2
         echo "            (a real clone, not a symlink) and re-run." >&2
         exit 1
     fi

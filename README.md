@@ -77,7 +77,7 @@ sudo smd install gpsdo-monitor
 
 The catalog entry in
 [`sigmond/etc/catalog.toml`](https://github.com/mijahauan/sigmond/blob/main/etc/catalog.toml)
-clones this repo to `/opt/git/gpsdo-monitor` and runs `install.sh`.
+clones this repo to `/opt/git/sigmond/gpsdo-monitor` and runs `install.sh`.
 Add `[component.gpsdo-monitor] enabled = true` to
 `/etc/sigmond/topology.toml` if you want the full-suite walk (`smd
 install` without args) to include it.
@@ -85,8 +85,8 @@ install` without args) to include it.
 ### Standalone
 
 ```sh
-git clone https://github.com/mijahauan/gpsdo-monitor /opt/git/gpsdo-monitor
-sudo /opt/git/gpsdo-monitor/install.sh
+git clone https://github.com/mijahauan/gpsdo-monitor /opt/git/sigmond/gpsdo-monitor
+sudo /opt/git/sigmond/gpsdo-monitor/install.sh
 ```
 
 The installer is idempotent and sets up:
@@ -166,7 +166,7 @@ full composition without USB hardware.
 ### Editable install on the station host
 
 Skip the push-and-reinstall dance when you're iterating against live
-hardware. `install.sh --dev` symlinks `/opt/git/gpsdo-monitor` at the
+hardware. `install.sh --dev` symlinks `/opt/git/sigmond/gpsdo-monitor` at the
 checkout you ran it from and pip-installs editable:
 
 ```sh
@@ -174,7 +174,7 @@ sudo ~/git/gpsdo-monitor/install.sh --dev
 ```
 
 End state: the systemd daemon runs from site-packages, whose `.pth`
-points at `/opt/git/gpsdo-monitor` (→ `~/git/gpsdo-monitor`). Edit
+points at `/opt/git/sigmond/gpsdo-monitor` (→ `~/git/gpsdo-monitor`). Edit
 Python, `sudo systemctl restart gpsdo-monitor.service`, done — no
 `pip install` between edit and restart. Sigmond's `smd install` /
 `smd status` / deploy.toml lookup all find the canonical symlink, so
@@ -182,7 +182,7 @@ the rest of the suite sees a normal install.
 
 The `gpsdo` service user must be able to traverse your repo path. On
 a host with `/home/<you>` set to mode 700 (typical for shared
-machines), relocate the canonical checkout to `/opt/git/gpsdo-monitor`
+machines), relocate the canonical checkout to `/opt/git/sigmond/gpsdo-monitor`
 directly (owner = you, mode 755) and point a reverse symlink from
 `~/git/gpsdo-monitor` if you want the dev shortcut. `install.sh --dev`
 refuses to install into an unreadable tree.
@@ -203,7 +203,7 @@ hf-timestd's pull-to-deploy:
 
 ```sh
 # after committing locally and pushing:
-sudo /opt/git/gpsdo-monitor/scripts/deploy.sh --pull
+sudo /opt/git/sigmond/gpsdo-monitor/scripts/deploy.sh --pull
 ```
 
 The script refuses to run on a dirty tree (`--force-dirty` to bypass),

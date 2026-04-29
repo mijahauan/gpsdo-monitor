@@ -24,7 +24,7 @@
 #   6. Print the active git SHA so you can see what just deployed.
 #
 # This assumes the repo was originally installed in --dev mode (editable
-# install + /opt/git/gpsdo-monitor symlink). For a plain copy install,
+# install + /opt/git/sigmond/gpsdo-monitor symlink). For a plain copy install,
 # re-running `install.sh` is the equivalent operation.
 #
 # Usage:
@@ -140,7 +140,7 @@ else
         log_error "directory of $REPO_DIR is not traversable by $SERVICE_USER"
         log_error "(typically a home directory with mode 700)."
         log_error ""
-        log_error "fix: relocate the repo to /opt/git/gpsdo-monitor (a real"
+        log_error "fix: relocate the repo to /opt/git/sigmond/gpsdo-monitor (a real"
         log_error "     clone, not a symlink) and re-run install.sh."
         exit 4
     fi
