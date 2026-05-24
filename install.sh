@@ -1,182 +1,157 @@
-#!/usr/bin/env bash
-# gpsdo-monitor canonical installer.
+#!/bin/bash
 #
-# Called directly by operators, or delegated to by sigmond's catalog
-# installer. Idempotent.
+# gpsdo-monitor installation/upgrade script
 #
-# Modes:
-#   install.sh             # production install — copy pip install from
-#                          #   the repo directory into system Python.
-#   install.sh --dev       # development install — symlink
-#                          #   /opt/git/sigmond/gpsdo-monitor to this repo so
-#                          #   sigmond's canonical-path logic finds it,
-#                          #   and use `pip install -e` so Python edits
-#                          #   take effect on `systemctl restart` with
-#                          #   no re-install. See README "Development
-#                          #   setup".
-set -euo pipefail
+# Idempotent.  Installs or upgrades:
+#   - gpsdo service user (created via systemd-sysusers)
+#   - /etc/udev/rules.d/99-gpsdo.rules
+#   - Python venv at /opt/gpsdo-monitor/venv (editable install)
+#   - /usr/local/bin/gpsdo-monitor -> /opt/gpsdo-monitor/venv/bin/gpsdo-monitor
+#   - Rendered config at /etc/gpsdo-monitor/config.toml
+#   - Systemd unit (gpsdo-monitor.service)
+#
+# Always editable: $REPO_ROOT is the canonical source, code edits land
+# on the next `systemctl restart gpsdo-monitor.service` with no
+# re-install.  Matches the mag/psk/wspr-recorder pattern.
+#
+# Usage:
+#   sudo ./install.sh              # install or upgrade
+#   sudo ./install.sh --uninstall  # remove
+#
 
-REPO_DIR="${REPO_DIR:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}"
-PREFIX="${PREFIX:-/usr/local}"
-CONF_DIR="${CONF_DIR:-/etc/gpsdo-monitor}"
-UDEV_DIR="${UDEV_DIR:-/etc/udev/rules.d}"
-SYSTEMD_DIR="${SYSTEMD_DIR:-/etc/systemd/system}"
-SYSUSERS_DIR="${SYSUSERS_DIR:-/etc/sysusers.d}"
-CANONICAL_DIR="${CANONICAL_DIR:-/opt/git/sigmond/gpsdo-monitor}"
-SERVICE_USER="${SERVICE_USER:-gpsdo}"
+set -e
 
-DEV_MODE=false
+INSTALL_DIR="/opt/gpsdo-monitor"
+CONFIG_DIR="/etc/gpsdo-monitor"
+SERVICE_USER="gpsdo"
+SERVICE_GROUP="gpsdo"
 
-while [[ $# -gt 0 ]]; do
-    case $1 in
-        --dev)  DEV_MODE=true; shift ;;
-        -h|--help)
-            sed -n '3,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-        *) echo "unknown flag: $1" >&2; exit 2 ;;
-    esac
-done
+REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
 
-require_root() {
-    if [[ $EUID -ne 0 ]]; then
-        echo "error: $0 must be run as root (use sudo)" >&2
-        exit 1
-    fi
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+info()  { echo -e "${GREEN}[INFO]${NC} $1"; }
+warn()  { echo -e "${YELLOW}[WARN]${NC} $1"; }
+error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
+
+check_root() {
+    [[ $EUID -eq 0 ]] || error "Run as root (sudo)."
 }
 
-install_deps() {
+check_dependencies() {
+    info "Checking dependencies..."
+    command -v python3 >/dev/null || error "python3 not found"
+    python3 -c "import venv" 2>/dev/null || error "python3-venv missing (apt install python3-venv)"
+    # libhidapi-hidraw0 is required by the `hidapi` PyPI wheel at import time.
+    # apt-get is best-effort -- some hosts don't have apt; warn rather than error.
     if command -v apt-get >/dev/null 2>&1; then
-        apt-get install -y --no-install-recommends \
-            python3 python3-pip python3-venv libhidapi-hidraw0
+        apt-get install -y --no-install-recommends libhidapi-hidraw0 >/dev/null 2>&1 || \
+            warn "apt-get install libhidapi-hidraw0 failed; install it manually if hidapi import fails."
     else
-        echo "warn: no apt-get; install Python 3.11+ and libhidapi-hidraw manually" >&2
+        warn "no apt-get; ensure libhidapi-hidraw0 (or equivalent) is installed manually."
     fi
 }
 
-install_user() {
-    install -d -m 0755 "$SYSUSERS_DIR"
-    install -m 0644 "$REPO_DIR/deploy/sysusers.d/gpsdo.conf" "$SYSUSERS_DIR/gpsdo.conf"
+create_user() {
+    info "Creating service user ${SERVICE_USER}..."
+    install -d -m 0755 /etc/sysusers.d
+    install -m 0644 "$REPO_ROOT/deploy/sysusers.d/gpsdo.conf" /etc/sysusers.d/gpsdo.conf
     systemd-sysusers
+    if id "$SERVICE_USER" &>/dev/null; then
+        info "  ${SERVICE_USER} ready"
+    else
+        error "systemd-sysusers did not create ${SERVICE_USER}"
+    fi
 }
 
-install_udev() {
-    install -d -m 0755 "$UDEV_DIR"
-    install -m 0644 "$REPO_DIR/deploy/99-gpsdo.rules" "$UDEV_DIR/99-gpsdo.rules"
+install_udev_rule() {
+    info "Installing udev rule for Leo Bodnar GPSDO..."
+    install -m 0644 "$REPO_ROOT/deploy/99-gpsdo.rules" /etc/udev/rules.d/99-gpsdo.rules
     udevadm control --reload-rules
     udevadm trigger --attr-match=subsystem=hidraw || true
     udevadm trigger --attr-match=subsystem=tty    || true
 }
 
-install_canonical_symlink() {
-    # Dev mode only. Points /opt/git/sigmond/gpsdo-monitor at this checkout so
-    # sigmond's deploy.toml lookup + the canonical-path convention keep
-    # working without a second clone that would drift from the dev
-    # tree. Refuses to clobber an existing real directory — a fresh
-    # production install should remove /opt/git/sigmond/gpsdo-monitor first.
-    install -d -m 0755 "$(dirname "$CANONICAL_DIR")"
-    if [[ -L "$CANONICAL_DIR" ]]; then
-        local current target
-        current="$(readlink -f "$CANONICAL_DIR")"
-        target="$(readlink -f "$REPO_DIR")"
-        if [[ "$current" == "$target" ]]; then
-            echo "canonical symlink already points at $target"
-            return
-        fi
-        echo "error: $CANONICAL_DIR is a symlink to $current" >&2
-        echo "       remove it and re-run: sudo rm $CANONICAL_DIR" >&2
-        exit 1
+install_application() {
+    info "Installing Python application to ${INSTALL_DIR}..."
+    if [[ ! -d "$INSTALL_DIR/venv" ]]; then
+        install -d -m 0755 "$INSTALL_DIR"
+        python3 -m venv "$INSTALL_DIR/venv"
     fi
-    if [[ -e "$CANONICAL_DIR" ]]; then
-        echo "error: $CANONICAL_DIR already exists (not a symlink)" >&2
-        echo "       a previous production install is there; remove it first:" >&2
-        echo "       sudo rm -rf $CANONICAL_DIR" >&2
-        exit 1
+    # Pre-clean any leftover egg-info from prior dev installs in the
+    # source tree -- setuptools' "Cannot update time stamp" check
+    # inside the build sandbox would abort the editable install if
+    # ownership has drifted.  Safe to delete; pip recreates it.
+    rm -rf "$REPO_ROOT/src"/*.egg-info "$REPO_ROOT"/*.egg-info 2>/dev/null || true
+    "$INSTALL_DIR/venv/bin/pip" install --quiet --upgrade pip setuptools wheel
+    # Editable install: $REPO_ROOT is the canonical source.  Mirrors
+    # mag/psk/wspr-recorder -- restart-to-pick-up-edits, no
+    # re-install required for pure-Python changes.
+    "$INSTALL_DIR/venv/bin/pip" install --quiet --upgrade -e "$REPO_ROOT"
+    # The service user must be able to traverse the repo to import
+    # the package in editable mode.  $REPO_ROOT under
+    # /opt/git/sigmond is group-readable (mode 2775) so this is
+    # normally fine; the check catches the case of a repo cloned
+    # somewhere unreadable (e.g. under /home with mode 700).
+    if ! sudo -u "$SERVICE_USER" test -r "$REPO_ROOT/src/gpsdo_monitor/__init__.py"; then
+        error "Service user $SERVICE_USER cannot read $REPO_ROOT/src/gpsdo_monitor/__init__.py.
+    Fix: ensure the repo lives at /opt/git/sigmond/gpsdo-monitor (the canonical, group-readable
+    location), or chmod g+rx the path and ensure $SERVICE_USER is in the owner's group."
     fi
-    ln -s "$REPO_DIR" "$CANONICAL_DIR"
-    echo "linked $CANONICAL_DIR -> $REPO_DIR"
+    # Symlink the venv entry point so `gpsdo-monitor` works on $PATH
+    # (and so the unit's ExecStart=/usr/local/bin/gpsdo-monitor resolves
+    # to the venv interpreter via the setuptools-generated shebang).
+    ln -sfn "$INSTALL_DIR/venv/bin/gpsdo-monitor" /usr/local/bin/gpsdo-monitor
+    info "  installed; CLI: $(head -1 "$INSTALL_DIR/venv/bin/gpsdo-monitor")"
 }
 
-verify_traversable() {
-    # An editable install records the repo path in a .pth file. If the
-    # service user can't traverse it at runtime, systemd fails to
-    # import the package even though `pip install -e` succeeded as
-    # root. Catch that trap here.
-    if ! id -u "$SERVICE_USER" &>/dev/null; then
-        return  # sysusers step will create it; skip pre-check
-    fi
-    local probe="$REPO_DIR/src/gpsdo_monitor/__init__.py"
-    if ! sudo -u "$SERVICE_USER" test -r "$probe"; then
-        echo "error: $SERVICE_USER cannot read $probe" >&2
-        echo "       one of the parent directories is not traversable" >&2
-        echo "       (typically a home directory with mode 700)." >&2
-        echo "" >&2
-        echo "       fix: relocate the repo to /opt/git/sigmond/gpsdo-monitor" >&2
-        echo "            (a real clone, not a symlink) and re-run." >&2
-        exit 1
-    fi
-}
-
-install_python() {
-    if [[ "$DEV_MODE" == "true" ]]; then
-        # Editable: systemd runs code from $REPO_DIR via the .pth file
-        # pip writes into site-packages. Restart-to-pick-up-edits, no
-        # re-install required for pure-Python changes.
-        python3 -m pip install --break-system-packages -e "$REPO_DIR"
+install_config() {
+    info "Installing config template..."
+    install -d -m 0755 "$CONFIG_DIR"
+    if [[ ! -f "$CONFIG_DIR/config.toml" ]]; then
+        install -m 0644 "$REPO_ROOT/deploy/config.example.toml" "$CONFIG_DIR/config.toml"
+        info "  rendered $CONFIG_DIR/config.toml"
     else
-        python3 -m pip install --break-system-packages --upgrade "$REPO_DIR"
+        info "  $CONFIG_DIR/config.toml already present (not overwritten)"
     fi
 }
 
-install_systemd() {
-    install -d -m 0755 "$SYSTEMD_DIR"
-    install -m 0644 "$REPO_DIR/deploy/gpsdo-monitor.service" "$SYSTEMD_DIR/gpsdo-monitor.service"
-    install -d -m 0755 "$CONF_DIR"
-    if [[ ! -f "$CONF_DIR/config.toml" ]]; then
-        install -m 0644 "$REPO_DIR/deploy/config.example.toml" "$CONF_DIR/config.toml"
-    fi
-    # Dev installs frequently point the editable .pth at a path under
-    # /home, which the unit's ProtectHome=true hides from the service.
-    # Add a drop-in that relaxes it to read-only (still blocks writes
-    # to /home — keeps the hardening intent intact). Safe no-op when
-    # REPO_DIR isn't under /home.
-    if [[ "$DEV_MODE" == "true" ]]; then
-        local dropin_dir="$SYSTEMD_DIR/gpsdo-monitor.service.d"
-        install -d -m 0755 "$dropin_dir"
-        cat > "$dropin_dir/dev.conf" <<'UNITEOF'
-# Written by install.sh --dev. The editable install points at the
-# repo under /home; unit's ProtectHome=true would hide it, so the
-# service would fail to import the package. read-only keeps /home
-# accessible (imports work) while still blocking writes.
-[Service]
-ProtectHome=read-only
-UNITEOF
-    fi
+install_systemd_unit() {
+    info "Installing systemd unit..."
+    install -m 0644 "$REPO_ROOT/deploy/gpsdo-monitor.service" /etc/systemd/system/gpsdo-monitor.service
     systemctl daemon-reload
     systemctl enable gpsdo-monitor.service
     systemctl restart gpsdo-monitor.service || true
 }
 
+uninstall() {
+    info "Removing gpsdo-monitor..."
+    systemctl disable --now gpsdo-monitor.service 2>/dev/null || true
+    rm -f /etc/systemd/system/gpsdo-monitor.service \
+          /usr/local/bin/gpsdo-monitor \
+          /etc/udev/rules.d/99-gpsdo.rules
+    systemctl daemon-reload || true
+    udevadm control --reload-rules 2>/dev/null || true
+    info "Removed binary, unit, udev rule."
+    info "Kept (delete by hand if desired): ${INSTALL_DIR}, ${CONFIG_DIR}, user '${SERVICE_USER}'."
+}
+
 main() {
-    require_root
-    install_deps
-    install_user
-    install_udev
-    if [[ "$DEV_MODE" == "true" ]]; then
-        install_canonical_symlink
-        verify_traversable
+    check_root
+    if [[ "${1:-}" == "--uninstall" ]]; then
+        uninstall
+        return
     fi
-    install_python
-    install_systemd
-    if [[ "$DEV_MODE" == "true" ]]; then
-        echo ""
-        echo "gpsdo-monitor installed (dev mode)."
-        echo "  canonical path: $CANONICAL_DIR -> $REPO_DIR"
-        echo "  edit Python code directly in $REPO_DIR, then:"
-        echo "    sudo systemctl restart gpsdo-monitor.service"
-        echo ""
-        echo "Status:"
-    else
-        echo "gpsdo-monitor installed. Status:"
-    fi
+    check_dependencies
+    create_user
+    install_udev_rule
+    install_application
+    install_config
+    install_systemd_unit
+    info "Install complete.  Status:"
     systemctl --no-pager status gpsdo-monitor.service || true
 }
 
