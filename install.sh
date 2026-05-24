@@ -2,7 +2,12 @@
 #
 # gpsdo-monitor installation/upgrade script
 #
+# Tooling: uv (https://astral.sh/uv) is the canonical venv + installer
+# across the sigmond suite.  If it's not present, this script installs
+# it system-wide to /usr/local/bin via the Astral installer.
+#
 # Idempotent.  Installs or upgrades:
+#   - uv (if missing) at /usr/local/bin/uv
 #   - gpsdo service user (created via systemd-sysusers)
 #   - /etc/udev/rules.d/99-gpsdo.rules
 #   - Python venv at /opt/gpsdo-monitor/venv (editable install)
@@ -17,6 +22,11 @@
 # Usage:
 #   sudo ./install.sh              # install or upgrade
 #   sudo ./install.sh --uninstall  # remove
+#
+# To force-recreate the venv (e.g. after a Python upgrade):
+#   sudo systemctl stop gpsdo-monitor.service
+#   sudo rm -rf /opt/gpsdo-monitor/venv
+#   sudo ./install.sh   # recreates venv + restarts service
 #
 
 set -e
@@ -41,10 +51,31 @@ check_root() {
     [[ $EUID -eq 0 ]] || error "Run as root (sudo)."
 }
 
+# Ensures `uv` is on PATH.  If missing, installs from astral.sh into
+# /usr/local/bin so root + every interactive user sees it (the gpsdo
+# service user doesn't need uv at runtime -- once the venv exists,
+# Python imports are self-contained).
+_ensure_uv() {
+    if command -v uv >/dev/null 2>&1; then
+        info "  uv $(uv --version 2>/dev/null | awk '{print $2}') at $(command -v uv)"
+        return
+    fi
+    info "  uv not found -- installing system-wide to /usr/local/bin"
+    command -v curl >/dev/null || error "curl not found (apt install curl)"
+    # Astral installer honors XDG_BIN_HOME for target dir; UV_NO_MODIFY_PATH=1
+    # because /usr/local/bin is already on every shell's PATH (the older
+    # --no-modify-path flag is deprecated as of uv 0.11.x).
+    if ! curl -LsSf https://astral.sh/uv/install.sh | env XDG_BIN_HOME=/usr/local/bin UV_NO_MODIFY_PATH=1 sh; then
+        error "uv installer failed"
+    fi
+    command -v uv >/dev/null || error "uv installer ran but uv is still not on PATH"
+    info "  uv $(uv --version 2>/dev/null | awk '{print $2}') installed"
+}
+
 check_dependencies() {
     info "Checking dependencies..."
     command -v python3 >/dev/null || error "python3 not found"
-    python3 -c "import venv" 2>/dev/null || error "python3-venv missing (apt install python3-venv)"
+    _ensure_uv
     # libhidapi-hidraw0 is required by the `hidapi` PyPI wheel at import time.
     # apt-get is best-effort -- some hosts don't have apt; warn rather than error.
     if command -v apt-get >/dev/null 2>&1; then
@@ -79,18 +110,19 @@ install_application() {
     info "Installing Python application to ${INSTALL_DIR}..."
     if [[ ! -d "$INSTALL_DIR/venv" ]]; then
         install -d -m 0755 "$INSTALL_DIR"
-        python3 -m venv "$INSTALL_DIR/venv"
+        # --seed populates pip/setuptools/wheel for compatibility with
+        # tooling that shells out to pip; harmless overhead otherwise.
+        uv venv "$INSTALL_DIR/venv" --python 3.11 --seed --quiet
     fi
     # Pre-clean any leftover egg-info from prior dev installs in the
     # source tree -- setuptools' "Cannot update time stamp" check
     # inside the build sandbox would abort the editable install if
-    # ownership has drifted.  Safe to delete; pip recreates it.
+    # ownership has drifted.  Safe to delete; uv recreates it.
     rm -rf "$REPO_ROOT/src"/*.egg-info "$REPO_ROOT"/*.egg-info 2>/dev/null || true
-    "$INSTALL_DIR/venv/bin/pip" install --quiet --upgrade pip setuptools wheel
     # Editable install: $REPO_ROOT is the canonical source.  Mirrors
     # mag/psk/wspr-recorder -- restart-to-pick-up-edits, no
     # re-install required for pure-Python changes.
-    "$INSTALL_DIR/venv/bin/pip" install --quiet --upgrade -e "$REPO_ROOT"
+    uv pip install --quiet --python "$INSTALL_DIR/venv/bin/python3" -e "$REPO_ROOT"
     # The service user must be able to traverse the repo to import
     # the package in editable mode.  $REPO_ROOT under
     # /opt/git/sigmond is group-readable (mode 2775) so this is
