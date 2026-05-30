@@ -110,3 +110,32 @@ def test_fix_age_tracks_wall_clock():
     age = st.fix_age_sec(now=t0 + 3.14)
     assert age is not None
     assert abs(age - 3.14) < 1e-6
+
+
+def test_nmea_reader_survives_repeated_open_failures():
+    """Regression: a missing device must not kill the reader thread.
+
+    Earlier behaviour was to set ``open_error`` once and exit the
+    thread, leaving NMEA permanently dark until the daemon restarted.
+    The reader now retries on every cycle with a short backoff so a
+    transient race (another process briefly opening the tty) can
+    recover automatically.
+    """
+    from pathlib import Path
+
+    from gpsdo_monitor.nmea import NmeaReader
+
+    reader = NmeaReader(Path("/dev/definitely-nonexistent-for-test"))
+    # Shorten the backoff so the test is fast — internal constant.
+    reader._REOPEN_BACKOFF_S = 0.05  # type: ignore[attr-defined]
+    reader.start()
+    try:
+        # Spin long enough for several open-failure cycles.
+        time.sleep(0.3)
+        assert reader._thread is not None
+        assert reader._thread.is_alive(), \
+            "reader thread must survive repeated open failures"
+        assert reader.open_error is not None
+        assert "nonexistent" in reader.open_error
+    finally:
+        reader.stop()

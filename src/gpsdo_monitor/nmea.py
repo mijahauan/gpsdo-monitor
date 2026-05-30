@@ -277,43 +277,36 @@ class NmeaReader:
                 host_monotonic_at_read=self._state.host_monotonic_at_read,
             )
 
+    # Backoff cap for the reopen-on-error loop.  Read errors during a
+    # transient race (another process briefly opening the device) can
+    # fire in tight bursts; we don't want to hammer the kernel, but we
+    # MUST keep retrying or the NMEA reader stays dead until daemon
+    # restart.  Cap chosen to recover within one health-probe interval.
+    _REOPEN_BACKOFF_S = 1.0
+
     def _run(self) -> None:
         import serial  # pyserial; imported lazily
 
-        try:
-            self._serial = serial.Serial(
-                str(self.tty_path), baudrate=self.baudrate, timeout=0.2,
-                rtscts=False, dsrdtr=False,
-            )
-        except (OSError, serial.SerialException) as e:
-            self._open_error = f"{type(e).__name__}: {e}"
-            return
-
-        try:
-            while not self._stop.is_set():
-                try:
-                    raw = self._serial.readline()
-                except (OSError, serial.SerialException, TypeError):
-                    # Three failure modes lumped together because the
-                    # right response is the same — exit cleanly:
-                    #   - OSError: port vanished (device unplugged)
-                    #   - SerialException: pyserial surface of the above
-                    #   - TypeError: stop() closed the fd while the
-                    #     worker was blocked in readline; pyserial
-                    #     re-enters os.read with fd=None. The stop
-                    #     signal is already set, so bail.
+        while not self._stop.is_set():
+            try:
+                self._serial = serial.Serial(
+                    str(self.tty_path), baudrate=self.baudrate, timeout=0.2,
+                    rtscts=False, dsrdtr=False,
+                )
+                # Clear any previous open_error so callers can see we
+                # recovered.  Set fresh on subsequent failures.
+                self._open_error = None
+            except (OSError, serial.SerialException) as e:
+                self._open_error = f"{type(e).__name__}: {e}"
+                # Wait before retrying; respect stop signal.
+                if self._stop.wait(self._REOPEN_BACKOFF_S):
                     return
-                if not raw:
-                    continue
-                try:
-                    line = raw.decode("ascii", errors="replace").strip()
-                except UnicodeDecodeError:
-                    continue
-                if not line.startswith("$"):
-                    continue
-                with self._lock:
-                    feed(self._state, line)
-        finally:
+                continue
+
+            if self._read_until_error():
+                # Clean stop requested.
+                return
+            # Read loop exited due to error — close and reopen.
             s = self._serial
             self._serial = None
             if s is not None:
@@ -321,3 +314,39 @@ class NmeaReader:
                     s.close()
                 except Exception:
                     pass
+            if self._stop.wait(self._REOPEN_BACKOFF_S):
+                return
+
+    def _read_until_error(self) -> bool:
+        """Read NMEA lines from the open serial until error or stop.
+
+        Returns True if the loop exited because :py:attr:`_stop` was set
+        (clean shutdown — caller should not reopen), False if a read
+        error broke the loop (caller should close + reopen).
+        """
+        import serial  # pyserial; for SerialException type
+        while not self._stop.is_set():
+            try:
+                raw = self._serial.readline()
+            except (OSError, serial.SerialException, TypeError):
+                # Three failure modes lumped together because the
+                # right response is the same — break out and let
+                # _run() decide whether to reopen:
+                #   - OSError: port vanished (device unplugged)
+                #   - SerialException: pyserial surface of the above
+                #   - TypeError: stop() closed the fd while the
+                #     worker was blocked in readline; pyserial
+                #     re-enters os.read with fd=None.  If stop is
+                #     already set, _run() will exit cleanly.
+                return self._stop.is_set()
+            if not raw:
+                continue
+            try:
+                line = raw.decode("ascii", errors="replace").strip()
+            except UnicodeDecodeError:
+                continue
+            if not line.startswith("$"):
+                continue
+            with self._lock:
+                feed(self._state, line)
+        return True
