@@ -82,6 +82,10 @@ class DeviceWorker:
     firmware_advisory: Optional[FirmwareAdvisory] = None
     mon_ver_tried: bool = False
     started_mono: float = 0.0
+    # Last full DeviceReport from build_report() — cached so the fast
+    # NMEA-only republish path can overlay just the NMEA-derived Health
+    # fields without re-polling HID (which is hundreds of ms per call).
+    last_report: Optional[DeviceReport] = None
 
     # --- lifecycle ---------------------------------------------------
 
@@ -190,7 +194,7 @@ class DeviceWorker:
             raw_trailing_hex=raw.raw_trailing_hex,
         )
 
-        return new_report(
+        report = new_report(
             host=host,
             probe_interval_sec=self.cfg.probe_interval_sec,
             device=device,
@@ -202,18 +206,67 @@ class DeviceWorker:
             a_level_reason=reason,
             firmware_advisory=self.firmware_advisory,
         )
+        self.last_report = report
+        return report
+
+    def refresh_nmea_only(self, *, now: float) -> Optional[DeviceReport]:
+        """Build a fresh report by overlaying current NMEA state on top
+        of the last full report.  Used by the fast-publish loop so the
+        ``health.pps_utc_sec`` / ``health.fix_age_sec`` / ``health.gps_fix``
+        fields stay fresh at NMEA cadence (~1 Hz) instead of stalling
+        between probe ticks.
+
+        Returns ``None`` if no full report has been built yet (cold
+        start) or if NMEA isn't running on this device.  Does NOT touch
+        HID — the cost is just an NmeaState.snapshot() and a dataclass
+        copy.
+
+        Why this exists: hf-timestd's T6 BPSK PPS disambig pairs an
+        RTP-derived edge wall-time against NMEA's pps_utc_sec inside a
+        ±0.5 s guard.  With the full report written only every
+        probe_interval (default 10 s), pps_utc_sec was up to ~10 s
+        stale at consume time and the guard rejected the pairing.  See
+        project_t5_nmea_probe_race in hf-timestd's memory.
+        """
+        if self.last_report is None or self.nmea is None:
+            return None
+        import dataclasses
+        ns = self.nmea.snapshot()
+        new_health = dataclasses.replace(
+            self.last_report.health,
+            gps_fix=ns.gps_fix,
+            sats_used=ns.sats_used,
+            fix_age_sec=ns.fix_age_sec(now=now),
+            pps_utc_sec=ns.pps_utc_sec,
+            nmea_host_monotonic_at_read=ns.host_monotonic_at_read,
+        )
+        from gpsdo_monitor.schema import utc_now_iso
+        new_report = dataclasses.replace(
+            self.last_report,
+            health=new_health,
+            written_utc=utc_now_iso(),
+        )
+        self.last_report = new_report
+        return new_report
 
 
 # --- Service ------------------------------------------------------------
 
 
 class Service:
+    # Fast-publish cadence for NMEA-only republish.  1 Hz matches the
+    # LBE-1421 NMEA emission rate — the JSON file's pps_utc_sec will
+    # therefore be at most ~1 s stale, well inside hf-timestd's T6
+    # disambig ±0.5 s pairing guard.
+    _FAST_NMEA_INTERVAL_S = 1.0
+
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
         self.stopping = threading.Event()
         self.advertiser: Optional[Advertiser] = None
         self._workers: dict[str, DeviceWorker] = {}
         self._last_report_hint: dict[str, str] = {}
+        self._fast_nmea_thread: Optional[threading.Thread] = None
 
     # --- lifecycle -----------------------------------------------------
 
@@ -227,15 +280,49 @@ class Service:
                 self.advertiser = None
         signal.signal(signal.SIGTERM, self._on_signal)
         signal.signal(signal.SIGINT, self._on_signal)
+        # Fast NMEA republish loop — runs in parallel with the main
+        # probe tick so per-device JSON files refresh their NMEA fields
+        # (pps_utc_sec, fix_age_sec, gps_fix, sats_used) at NMEA cadence.
+        self._fast_nmea_thread = threading.Thread(
+            target=self._fast_nmea_loop,
+            name="gpsdo-fast-nmea-publish",
+            daemon=True,
+        )
+        self._fast_nmea_thread.start()
 
     def stop(self) -> None:
         self.stopping.set()
+        if self._fast_nmea_thread is not None:
+            self._fast_nmea_thread.join(timeout=2.0)
+            self._fast_nmea_thread = None
         for w in self._workers.values():
             w.stop()
         self._workers.clear()
         if self.advertiser is not None:
             self.advertiser.close()
             self.advertiser = None
+
+    def _fast_nmea_loop(self) -> None:
+        """Background thread that republishes per-device JSON every
+        :attr:`_FAST_NMEA_INTERVAL_S` with fresh NMEA fields overlaid
+        on the last full report.  Does not touch HID and does not
+        re-advertise mDNS.
+        """
+        while not self.stopping.is_set():
+            if self.stopping.wait(self._FAST_NMEA_INTERVAL_S):
+                return
+            now = time.time()
+            # Snapshot the dict to avoid iteration-during-mutation if
+            # _sync_workers fires concurrently.
+            for worker in list(self._workers.values()):
+                try:
+                    report = worker.refresh_nmea_only(now=now)
+                except Exception:
+                    log.exception("fast NMEA republish failed for %s",
+                                  self._key(worker.candidate))
+                    continue
+                if report is not None:
+                    self._write_report_file(report)
 
     def _on_signal(self, *_a: object) -> None:
         log.info("signal received, shutting down")
@@ -321,15 +408,21 @@ class Service:
         return out
 
     def _publish_report(self, report: DeviceReport) -> None:
-        filename = f"{_sanitize(report.device.serial)}.json"
-        path = self.cfg.run_dir / filename
-        atomic_write(str(path), report.to_json())
-        self._last_report_hint[report.device.serial] = report.a_level_hint
+        self._write_report_file(report)
         if self.advertiser is not None:
             try:
                 self.advertiser.publish(report, probe_age_sec=0.0)
             except Exception:
                 log.exception("mDNS publish failed for %s", report.device.serial)
+
+    def _write_report_file(self, report: DeviceReport) -> None:
+        """Atomic JSON write only — no mDNS re-advertisement.
+        Used by the fast NMEA republish loop to refresh per-device
+        files at ~1 Hz without spamming mDNS announcements."""
+        filename = f"{_sanitize(report.device.serial)}.json"
+        path = self.cfg.run_dir / filename
+        atomic_write(str(path), report.to_json())
+        self._last_report_hint[report.device.serial] = report.a_level_hint
 
     # --- index ---------------------------------------------------------
 
