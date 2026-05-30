@@ -17,6 +17,7 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from gpsdo_monitor.hid_xport import VID_LBE
@@ -30,6 +31,13 @@ class NmeaState:
     sats_used: int | None = None
     last_rmc_valid_wall: float | None = None   # time.time() of latest RMC with status 'A'
     bad_checksum_count: int = 0
+    # Integer UTC second the most recent RMC-valid sentence describes,
+    # paired with time.monotonic() at the moment that sentence was read.
+    # The pair is what hf-timestd's T5 disambig consumes — sub-second
+    # part of the NMEA time is intentionally discarded because it reflects
+    # sentence-emission delay, not the PPS edge.
+    pps_utc_sec: int | None = None
+    host_monotonic_at_read: float | None = None
 
     def fix_age_sec(self, *, now: float | None = None) -> float | None:
         """Wall-clock seconds since the last RMC we treated as valid.
@@ -97,8 +105,22 @@ def feed(state: NmeaState, line: str, *, now: float | None = None) -> None:
     if sentence == "RMC":
         # $xxRMC,utc,status,lat,N/S,lon,E/W,sog,cog,date,magvar,...
         # status 'A' = active/valid, 'V' = void.
-        if len(fields) > 2 and fields[2] == "A":
+        if len(fields) > 9 and fields[2] == "A":
             state.last_rmc_valid_wall = t
+            time_str = fields[1]
+            date_str = fields[9]
+            try:
+                hh = int(time_str[0:2])
+                mm = int(time_str[2:4])
+                ss = int(time_str[4:6])
+                dd = int(date_str[0:2])
+                mo = int(date_str[2:4])
+                yy = int(date_str[4:6])
+                dt = datetime(2000 + yy, mo, dd, hh, mm, ss, tzinfo=timezone.utc)
+                state.pps_utc_sec = int(dt.timestamp())
+                state.host_monotonic_at_read = time.monotonic()
+            except (ValueError, IndexError):
+                pass
     elif sentence == "GGA":
         # $xxGGA,utc,lat,N/S,lon,E/W,quality,numSV,hdop,...
         # quality: 0=invalid, 1=GPS, 2=DGPS, 4=RTK fix, 5=RTK float, 6=dead-reckoning, ...
@@ -251,6 +273,8 @@ class NmeaReader:
                 sats_used=self._state.sats_used,
                 last_rmc_valid_wall=self._state.last_rmc_valid_wall,
                 bad_checksum_count=self._state.bad_checksum_count,
+                pps_utc_sec=self._state.pps_utc_sec,
+                host_monotonic_at_read=self._state.host_monotonic_at_read,
             )
 
     def _run(self) -> None:

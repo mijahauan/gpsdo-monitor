@@ -153,6 +153,8 @@ class DeviceWorker:
             raw.health.gps_fix = ns.gps_fix
             raw.health.sats_used = ns.sats_used
             raw.health.fix_age_sec = ns.fix_age_sec(now=now)
+            raw.health.pps_utc_sec = ns.pps_utc_sec
+            raw.health.nmea_host_monotonic_at_read = ns.host_monotonic_at_read
 
         # PPS study: snapshot the rolling window. If tracker isn't
         # running (no CDC, or device config disabled it) fall back to a

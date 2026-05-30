@@ -41,6 +41,11 @@ class Health:
     antenna_ok: bool | None = None
     signal_loss_count: int | None = None
     gps_locked: bool | None = None      # HID status bit 0: GPS module reports lock
+    # Integer UTC second of the latest RMC-valid sentence, paired with
+    # time.monotonic() at the moment that sentence was read.  Consumed by
+    # hf-timestd's T5 (LB-1421) disambig path — see project_t5_nmea_probe_race.
+    pps_utc_sec: int | None = None
+    nmea_host_monotonic_at_read: float | None = None
 
 
 @dataclass
